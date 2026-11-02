@@ -11,7 +11,7 @@ Pi拡張がComfyUIとllama-serverのHTTP APIを直接操作する。接続先は
 | `src/comfy.ts` | ComfyUI API、入力アップロード、出力取得 |
 | `src/llama.ts` | llama-serverのモデル管理API |
 | `src/workflow.ts` | API形式ワークフローの編集と検証 |
-| `src/config.ts` | 接続先と任意設定の読み込み |
+| `src/config.ts` | 接続先と任意設定の読み書き |
 | `src/files.ts` | プロジェクト内のJSONファイル操作 |
 | `src/types.ts` | 共通の型とエラー |
 
@@ -50,4 +50,4 @@ API形式のJSONをPi側のプロジェクト内で編集する。ノードの�
 
 メモリ確認はComfyUIのCUDA/ROCm統計を利用する。統計の安定は全メモリ解放の証明ではなく、必要な空き容量は任意の `minFreeMiB` で指定する。未対応・不正な統計は復旧待ちとする。
 
-Piの強制終了後の自動後始末と、OOMの完全防止は保証しない。実GPUでの動作確認は未実施。
+Piの強制終了後の自動後始末と、OOMの完全防止は保証しない。AMD Radeon RX 7900 XTX / ROCm上で、ComfyUIのSDXL 512×512静止画生成とllama-serverモデルの復帰後推論を確認した。動画生成、キャンセル、障害復旧は実GPUで未確認。

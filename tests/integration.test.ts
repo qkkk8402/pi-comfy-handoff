@@ -107,3 +107,127 @@ test('extension registers its tools and commands', () => {
   for (const name of ['comfy_generate', 'comfy_workflow', 'comfy_upload']) assert.equal(tools.get(name).executionMode, 'sequential');
   assert.ok(commands.has('comfy')); assert.ok(events.has('input'));
 });
+
+test('/comfy setup saves validated endpoints, keeps optional config, and cancels safely', async () => {
+  await mkdir('work', { recursive: true });
+  const cwd = await mkdtemp(join(process.cwd(), 'work', 'setup-integration-'));
+  try {
+    await mkdir(join(cwd, '.pi'), { recursive: true });
+    const initial = { comfyuiUrl: 'http://127.0.0.1:8188', llamaServerUrl: 'http://127.0.0.1:8080', minFreeMiB: 512, outputDir: 'renders' };
+    const configPath = join(cwd, '.pi/comfyui.json');
+    await writeFile(configPath, JSON.stringify(initial));
+    const { commands } = register();
+    const notices: Array<{ message: string; type?: string }> = [];
+    let answers: Array<string | undefined> = [];
+    let idle = true;
+    let beforeSecondAnswer: (() => Promise<void>) | undefined;
+    const ctx = {
+      cwd, hasUI: true, isIdle: () => idle,
+      ui: {
+        input: async () => {
+          const answer = answers.shift();
+          if (answers.length === 0 && beforeSecondAnswer) { const action = beforeSecondAnswer; beforeSecondAnswer = undefined; await action(); }
+          return answer;
+        },
+        notify: (message: string, type?: string) => notices.push({ message, type }),
+      },
+    };
+    const setup = () => commands.get('comfy').handler('setup', ctx);
+
+    answers = ['https://comfy.example.test/prefix', 'http://llama.example.test:8080'];
+    await setup();
+    assert.deepEqual(JSON.parse(await readFile(configPath, 'utf8')), {
+      ...initial, comfyuiUrl: 'https://comfy.example.test/prefix', llamaServerUrl: 'http://llama.example.test:8080',
+    });
+    const saved = await readFile(configPath, 'utf8');
+
+    answers = ['ftp://invalid.example', 'http://ignored.example'];
+    await setup();
+    assert.equal(await readFile(configPath, 'utf8'), saved);
+    assert.equal(notices.at(-1)?.type, 'error');
+
+    answers = ['http://changed.example', undefined];
+    await setup();
+    assert.equal(await readFile(configPath, 'utf8'), saved);
+
+    answers = ['', ''];
+    await setup();
+    assert.equal(await readFile(configPath, 'utf8'), saved);
+
+    idle = false;
+    answers = ['http://busy.example', 'http://busy-llama.example'];
+    await setup();
+    assert.equal(await readFile(configPath, 'utf8'), saved);
+    assert.equal(notices.at(-1)?.type, 'error');
+    idle = true;
+
+    ctx.hasUI = false;
+    await setup();
+    assert.equal(await readFile(configPath, 'utf8'), saved);
+    ctx.hasUI = true;
+
+    answers = ['http://changed.example', 'http://changed-llama.example'];
+    beforeSecondAnswer = async () => {
+      await mkdir(join(cwd, '.pi/comfy-state'), { recursive: true });
+      await writeFile(join(cwd, '.pi/comfy-state/runner-state.json'), JSON.stringify({
+        version: 1, id: 'unresolved', state: 'recovery_required', phase: 'recovery_required', completed: [], snapshot: [], workflows: [],
+        comfyuiUrl: initial.comfyuiUrl, llamaServerUrl: initial.llamaServerUrl,
+      }));
+    };
+    await setup();
+    assert.equal(await readFile(configPath, 'utf8'), saved);
+    assert.equal(notices.at(-1)?.type, 'error');
+  } finally { await rm(cwd, { recursive: true, force: true }); }
+});
+
+test('/comfy setup replaces cached ComfyUI and llama-server connections immediately', async () => {
+  await mkdir('work', { recursive: true });
+  const cwd = await mkdtemp(join(process.cwd(), 'work', 'setup-runtime-'));
+  const calls = new Map<string, number>();
+  const record = (key: string) => calls.set(key, (calls.get(key) ?? 0) + 1);
+  let oldModel = 'unloaded'; let newModel = 'unloaded';
+  const mockComfy = (key: string) => createServer((req, res) => {
+    record(`${key}:${req.url}`); res.setHeader('content-type', 'application/json');
+    if (req.url === '/object_info') res.end(JSON.stringify({ TestNode: { input: { required: { prompt: ['STRING', {}] } } } }));
+    else if (req.url === '/queue') res.end('{"queue_running":[],"queue_pending":[]}');
+    else { res.statusCode = 404; res.end('{}'); }
+  });
+  const mockLlama = (key: string, getModel: () => string, setModel: (value: string) => void, modelId: string) => createServer((req, res) => {
+    record(`${key}:${req.url}`); res.setHeader('content-type', 'application/json');
+    if (req.url === '/models') res.end(JSON.stringify({ data: [{ id: modelId, status: { value: getModel() } }] }));
+    else if (req.url === '/models/load' || req.url === '/models/unload') {
+      setModel(req.url.endsWith('/load') ? 'loaded' : 'unloaded'); res.end('{"success":true}');
+    } else { res.statusCode = 404; res.end('{}'); }
+  });
+  const oldComfy = mockComfy('old-comfy'); const newComfy = mockComfy('new-comfy');
+  const oldLlama = mockLlama('old-llama', () => oldModel, value => { oldModel = value; }, 'old-model');
+  const newLlama = mockLlama('new-llama', () => newModel, value => { newModel = value; }, 'new-model');
+  try {
+    const [oldComfyUrl, newComfyUrl, oldLlamaUrl, newLlamaUrl] = await Promise.all([
+      listen(oldComfy), listen(newComfy), listen(oldLlama), listen(newLlama),
+    ]);
+    await mkdir(join(cwd, '.pi'), { recursive: true });
+    await writeFile(join(cwd, '.pi/comfyui.json'), JSON.stringify({ comfyuiUrl: oldComfyUrl, llamaServerUrl: oldLlamaUrl }));
+    const { tools, commands } = register();
+    const answers: string[] = [newComfyUrl, newLlamaUrl];
+    const ctx = { cwd, hasUI: true, isIdle: () => true, model: undefined,
+      ui: { input: async () => answers.shift(), notify() {} } };
+    await tools.get('comfy_inspect').execute('old', {}, undefined, undefined, ctx);
+    await commands.get('comfy').handler('connect old-model', ctx);
+    assert.equal(oldModel, 'loaded');
+
+    await commands.get('comfy').handler('setup', ctx);
+    await tools.get('comfy_inspect').execute('new', {}, undefined, undefined, ctx);
+    await commands.get('comfy').handler('connect new-model', ctx);
+    assert.equal(newModel, 'loaded');
+    assert.ok((calls.get('new-comfy:/object_info') ?? 0) > 0);
+    assert.ok((calls.get('new-comfy:/queue') ?? 0) > 0);
+    assert.ok((calls.get('new-llama:/models') ?? 0) > 0);
+    assert.ok((calls.get('new-llama:/models/load') ?? 0) > 0);
+    assert.equal(calls.get('old-comfy:/object_info'), 1);
+    assert.equal(calls.get('old-llama:/models/load'), 1);
+  } finally {
+    await Promise.all([oldComfy, newComfy, oldLlama, newLlama].map(close));
+    await rm(cwd, { recursive: true, force: true });
+  }
+});

@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { createHash } from 'node:crypto';
-import { loadConfig } from './config.js';
+import { loadConfig, saveEndpoints } from './config.js';
 import { ComfyClient } from './comfy.js';
 import { LlamaRouterClient } from './llama.js';
 import { Runner } from './runner.js';
@@ -106,17 +106,40 @@ export default function extension(pi: ExtensionAPI): void {
     },
   });
   pi.registerCommand('comfy', {
-    description: 'Direct API control without the LLM: status | cancel | recover | connect [MODEL_ID]',
+    description: 'Direct API control without the LLM: status | cancel | recover | connect [MODEL_ID] | setup',
     async handler(args, ctx) {
       try {
-        const { runner } = runtime(ctx.cwd);
         const [command = 'status', id] = args.trim().split(/\s+/);
+        if (command === 'setup') {
+          if (!ctx.hasUI) throw new Error('Interactive setup requires Pi UI mode');
+          const existing = runtime(ctx.cwd);
+          const checkSetupState = async () => {
+            if (!ctx.isIdle()) throw new Error('Cannot change connections while Pi is running a turn or tool');
+            if (runtimes.get(ctx.cwd) !== existing) throw new Error('Runtime changed during setup; run /comfy setup again');
+            const state = await existing.runner.status();
+            if (existing.runner.isBusy || state.state === 'running' || state.state === 'recovery_required') {
+              throw new Error('Cannot change connections during an active or unresolved run');
+            }
+          };
+          await checkSetupState();
+          const config = loadConfig(ctx.cwd);
+          const comfyuiUrl = await ctx.ui.input(`ComfyUI URL (Enter: ${config.comfyuiUrl})`, config.comfyuiUrl);
+          if (comfyuiUrl === undefined) return;
+          const llamaServerUrl = await ctx.ui.input(`llama-server URL (Enter: ${config.llamaServerUrl})`, config.llamaServerUrl);
+          if (llamaServerUrl === undefined) return;
+          await checkSetupState();
+          await saveEndpoints(ctx.cwd, comfyuiUrl.trim() || config.comfyuiUrl, llamaServerUrl.trim() || config.llamaServerUrl);
+          runtimes.delete(ctx.cwd);
+          ctx.ui.notify('接続先を保存しました。新しい設定を使用します。', 'info');
+          return;
+        }
+        const { runner } = runtime(ctx.cwd);
         let result: unknown;
         if (command === 'status') result = await runner.status();
         else if (command === 'recover') result = await runner.recover();
         else if (command === 'cancel') { await runner.cancel(); result = await runner.status(); }
         else if (command === 'connect') { await runner.connect(id ?? ctx.model?.id); result = 'Model ready'; }
-        else throw new Error('Usage: /comfy status | cancel | recover | connect [MODEL_ID]');
+        else throw new Error('Usage: /comfy status | cancel | recover | connect [MODEL_ID] | setup');
         ctx.ui.notify(JSON.stringify(result, null, 2), 'info');
       } catch (error) { ctx.ui.notify(error instanceof Error ? error.message : String(error), 'error'); }
     },

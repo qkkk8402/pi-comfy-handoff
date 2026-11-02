@@ -36,6 +36,8 @@ export class Runner {
     this.journalPath = join(config.stateDir, 'runner-state.json');
   }
 
+  get isBusy(): boolean { return this.active; }
+
   async connect(modelId?: string): Promise<void> {
     await this.exclusive(async () => {
       const journal = await this.readJournal();

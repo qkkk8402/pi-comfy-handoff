@@ -1,4 +1,6 @@
 import { readFileSync } from 'node:fs';
+import { mkdir, rename, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import type { DirectConfig } from './types.js';
 
@@ -53,4 +55,23 @@ export function loadConfig(cwd = process.cwd(), file = resolve(cwd, '.pi/comfyui
   }
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Config must be a JSON object');
   return parseConfig(raw as Record<string, unknown>, cwd);
+}
+
+export async function saveEndpoints(cwd: string, comfyuiUrl: unknown, llamaServerUrl: unknown): Promise<void> {
+  const file = resolve(cwd, '.pi/comfyui.json');
+  const comfy = apiUrl(comfyuiUrl, 'ComfyUI URL');
+  const llama = apiUrl(llamaServerUrl, 'llama-server URL');
+  let raw: Record<string, unknown> = {};
+  try {
+    const value: unknown = JSON.parse(readFileSync(file, 'utf8'));
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Config must be a JSON object');
+    raw = value as Record<string, unknown>;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  const data = `${JSON.stringify({ ...raw, comfyuiUrl: comfy, llamaServerUrl: llama }, null, 2)}\n`;
+  await mkdir(resolve(cwd, '.pi'), { recursive: true });
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  await writeFile(temporary, data, { flag: 'wx', mode: 0o600 });
+  await rename(temporary, file);
 }

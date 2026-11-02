@@ -42,9 +42,15 @@ llama-server --models-dir /path/to/models --no-models-autoload
 
 モデルIDは `GET /models` が返す値を使います。ComfyUIも通常どおり起動してください。
 
-### 3. 接続設定
+### 3. Piの推論先を設定
 
-Piを実行するプロジェクトの `.pi/comfyui.json` に、2つのURLを設定します。
+Piを起動し、`/login llama.cpp` を実行してllama-serverのURL `http://127.0.0.1:8080` を登録します。次に `/llama` でモデルをロードし、`/model` でそのモデルを選ぶとPiが推論に使います。
+
+### 4. 拡張の接続先を設定
+
+プロジェクト内で `/comfy setup` を実行し、ComfyUIとllama-serverのURLを順番に入力します。ここでのllama-server URLはモデル管理用APIの接続先です。Piの推論接続とは別に保存されます。空のままEnterを押すと現在値を保ち、入力をキャンセルすると保存しません。接続先は保存後すぐ反映され、Piの再起動は不要です。
+
+JSONを直接編集する場合は、Piを実行するプロジェクトの `.pi/comfyui.json` に2つのURLを設定して、Piを再起動してください。
 
 ```json
 {
@@ -53,7 +59,7 @@ Piを実行するプロジェクトの `.pi/comfyui.json` に、2つのURLを設
 }
 ```
 
-別マシンや仮想OSでは、Piから到達できるホスト名/IPアドレスとポートを指定します。URLはネイティブAPIのルートを指定します（リバースプロキシのパスprefixは使用可能です）。llama-serverのURLに推論用の `/v1` は付けません。拡張が必要なAPIパスを追加します。設定変更はPiの再起動で反映します。
+別マシンや仮想OSでは、Piから到達できるホスト名/IPアドレスとポートを指定します。URLはネイティブAPIのルートを指定します（リバースプロキシのパスprefixは使用可能です）。llama-serverのURLに推論用の `/v1` は付けません。拡張が必要なAPIパスを追加します。
 
 任意設定を使う場合:
 
@@ -70,34 +76,9 @@ Piを実行するプロジェクトの `.pi/comfyui.json` に、2つのURLを設
 
 `outputDir`と`stateDir`はPi側のパスです。対象モデルは利用中のPiモデルIDを使用し、PiのIDがない場合は `llamaModel` または一意にロードされているモデルから解決します。認証が必要なら、環境変数 `COMFYUI_API_KEY`、`LLAMA_API_KEY` にBearerトークンを設定します。別の変数名を使う場合は設定の `comfyApiKeyEnv`、`llamaApiKeyEnv` で指定できます。`timeouts` には `requestMs`、`modelMs`、`generationMs`、`settleMs`、`pollMs` を任意設定できます。
 
-### 4. Piを llama-server へ接続
+Pi側でAPIキーを `/login llama.cpp` に登録した場合、拡張用のキーは別途 `LLAMA_API_KEY` 環境変数にも設定してください。ComfyUIのキーは `COMFYUI_API_KEY` に設定します。Piの推論URLには `/v1` が使われますが、`/comfy setup` には `http://127.0.0.1:8080` のようなAPIルートを入力します。
 
-Piの `~/.pi/agent/models.json` に OpenAI互換 provider を設定します。providerの `baseUrl` は `llamaServerUrl` に `/v1` を足した値です。モデルID、コンテキスト長、最大出力は使用モデルに合わせてください。
-
-```json
-{
-  "providers": {
-    "llama-local": {
-      "baseUrl": "http://127.0.0.1:8080/v1",
-      "api": "openai-completions",
-      "apiKey": "no-key",
-      "models": [{
-        "id": "MODEL_ID",
-        "name": "Local llama-server",
-        "reasoning": false,
-        "input": ["text"],
-        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-        "contextWindow": 32768,
-        "maxTokens": 4096
-      }]
-    }
-  }
-}
-```
-
-APIキーを使う場合は、Piのprovider設定と拡張の接続設定の両方でサーバーの要件に合わせます。拡張はPiの推論リクエストを中継しません。Pi標準のOpenAI互換providerを使います。
-
-Piでproviderのモデルを選びます。ソースから直接使う場合は、拡張を指定して起動します。
+ソースから直接使う場合は、拡張を指定して起動します。
 
 ```bash
 pi -e /path/to/pi-extension/src/extension.ts
@@ -141,7 +122,7 @@ LLMはllama-serverのモデル管理API、生成モデルはComfyUI APIで切り
 
 メモリ確認には、CUDA/ROCmでComfyUIが `type: cuda` として提供する統計を使用します。未対応・不正な統計ではLLM復帰を見送って復旧待ちになります。統計の安定だけでは必要な空き容量を保証しないため、必要に応じて `minFreeMiB` を設定します。APIだけでカスタムノード等の全メモリ解放を保証することはできません。
 
-モックHTTPサーバーによるテストを実施しています。実GPUでの動作確認は未実施です。
+AMD Radeon RX 7900 XTX / ROCm上で、llama-serverのモデルをアンロードし、ComfyUIでSDXLの512×512画像を1枚生成した後、llama-serverのモデルを復帰させて推論できることを確認しました。動作確認用に2ステップで生成しています。動画生成、キャンセル、障害復旧は実GPUで未確認です。モックHTTPサーバーによるテストも実施しています。
 
 ## 開発
 
