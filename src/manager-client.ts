@@ -16,13 +16,36 @@ export interface RunState {
 export interface GenerateRequest { id: string; modelId?: string; workflows: Workflow[] }
 
 export class ManagerHttpError extends Error {
-  constructor(readonly status: number, message: string) { super(`VRAM manager returned HTTP ${status}: ${message}`); }
+  constructor(readonly status: number, message: string, method = 'GET', endpoint = 'VRAM manager') {
+    super(`${method} ${endpoint} returned HTTP ${status}: ${message}`);
+  }
+}
+
+export class ManagerConnectionError extends TypeError {
+  constructor(message: string) { super(message); this.name = 'ManagerConnectionError'; }
+}
+
+function errorMessage(value: any, fallback: string): string {
+  const error = value?.error;
+  const message = typeof error === 'string' ? error
+    : typeof error?.message === 'string' ? error.message
+      : typeof value?.message === 'string' ? value.message : fallback;
+  return message.slice(0, 1000);
+}
+
+function endpointLabel(baseUrl: string, path: string): string {
+  const url = new URL(`${baseUrl}${path}`);
+  return `${url.origin}${url.pathname}`;
 }
 
 export class ManagerClient {
   readonly baseUrl: string;
   constructor(readonly config: ClientConfig, private readonly fetchImpl: typeof fetch = fetch) {
     this.baseUrl = config.managerUrl;
+  }
+
+  setApiKey(apiKey: string | undefined): void {
+    this.config.apiKey = apiKey;
   }
 
   async status(): Promise<RunState> {
@@ -75,7 +98,8 @@ export class ManagerClient {
 
   private async json(path: string, init: RequestInit = {}): Promise<any> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.config.timeouts.requestMs);
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, this.config.timeouts.requestMs);
     const headers = new Headers(init.headers);
     headers.set('accept', 'application/json');
     if (init.body && !headers.has('content-type') && typeof init.body === 'string') headers.set('content-type', 'application/json');
@@ -89,13 +113,19 @@ export class ManagerClient {
       let value: any;
       try { value = body ? JSON.parse(body) : undefined; }
       catch {
-        if (!response.ok) throw new ManagerHttpError(response.status, body.slice(0, 1000) || response.statusText);
+        if (!response.ok) throw new ManagerHttpError(response.status, body.slice(0, 1000) || response.statusText, init.method ?? 'GET', endpointLabel(this.baseUrl, path));
         throw new Error(`VRAM manager ${path} returned invalid JSON`);
       }
-      if (!response.ok) throw new ManagerHttpError(response.status, String(value?.error ?? value?.message ?? body ?? response.statusText));
+      if (!response.ok) throw new ManagerHttpError(response.status, errorMessage(value, body || response.statusText), init.method ?? 'GET', endpointLabel(this.baseUrl, path));
       return value;
     } catch (error) {
-      if (controller.signal.aborted) throw controller.signal.reason ?? error;
+      if (external?.aborted) throw external.reason ?? error;
+      if (timedOut) throw new ManagerConnectionError(`Request to VRAM manager at ${endpointLabel(this.baseUrl, path)} timed out after ${this.config.timeouts.requestMs}ms. Check manager availability and network latency.`);
+      if (!(error instanceof ManagerHttpError) && error instanceof TypeError) {
+        const detail = error.message.slice(0, 300);
+        const code = (error as TypeError & { cause?: NodeJS.ErrnoException }).cause?.code;
+        throw new ManagerConnectionError(`Cannot reach VRAM manager at ${endpointLabel(this.baseUrl, path)}${code ? ` (${code})` : ''}: ${detail}. Check that the manager is running and the URL, port, and network are correct.`);
+      }
       throw error;
     } finally {
       clearTimeout(timer);

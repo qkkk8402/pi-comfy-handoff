@@ -174,49 +174,55 @@ export class Runner {
       if (state.comfyuiUrl !== this.config.comfyuiUrl || state.llamaServerUrl !== this.config.llamaServerUrl) throw new Error('Configured endpoints differ from unresolved journal');
       if (TERMINAL.has(state.state)) return this.publicState(state);
       state.phase = 'recovering'; await this.persist(state);
-      if (state.promptId) {
-        const knownPromptId = state.promptId;
-        if (state.cancelledPromptId === knownPromptId) {
-          await this.waitQueueAbsent(knownPromptId);
-          state.promptId = undefined;
-          await this.cleanup(state, 'cancelled');
-          return this.publicState(state);
-        }
-        try {
-          const result = await this.adapters.comfy.wait(knownPromptId);
-          if (!state.completed.some(item => item.promptId === result.promptId)) state.completed.push(result);
-          state.promptId = undefined; state.submitUnknown = false;
-        } catch (error) {
-          if (error instanceof OutcomeUnknown) {
-            const queue = await this.adapters.comfy.queue();
-            if (queue.running.length || queue.pending.length) {
-              state.phase = 'recovery_required'; state.state = 'recovery_required'; state.error = message(error); await this.persist(state); return this.publicState(state);
-            }
-            state.error = `Prompt outcome is unknown; empty queue confirmed during explicit recovery: ${message(error)}`;
+      try {
+        if (state.promptId) {
+          const knownPromptId = state.promptId;
+          if (state.cancelledPromptId === knownPromptId) {
+            await this.waitQueueAbsent(knownPromptId);
             state.promptId = undefined;
-            await this.cleanup(state, 'failed');
+            await this.cleanup(state, 'cancelled');
             return this.publicState(state);
           }
-          const promptId = knownPromptId;
-          const q = await this.adapters.comfy.queue();
-          if (q.running.includes(promptId) || q.pending.includes(promptId)) {
-            await this.adapters.comfy.cancel(promptId); await this.waitQueueAbsent(promptId);
+          try {
+            const result = await this.adapters.comfy.wait(knownPromptId);
+            if (!state.completed.some(item => item.promptId === result.promptId)) state.completed.push(result);
+            state.promptId = undefined; state.submitUnknown = false;
+          } catch (error) {
+            if (error instanceof OutcomeUnknown) {
+              const queue = await this.adapters.comfy.queue();
+              if (queue.running.length || queue.pending.length) {
+                state.phase = 'recovery_required'; state.state = 'recovery_required'; state.error = message(error); await this.persist(state); return this.publicState(state);
+              }
+              state.error = `Prompt outcome is unknown; empty queue confirmed during explicit recovery: ${message(error)}`;
+              state.promptId = undefined;
+              await this.cleanup(state, 'failed');
+              return this.publicState(state);
+            }
+            const promptId = knownPromptId;
+            const q = await this.adapters.comfy.queue();
+            if (q.running.includes(promptId) || q.pending.includes(promptId)) {
+              await this.adapters.comfy.cancel(promptId); await this.waitQueueAbsent(promptId);
+            }
+            state.promptId = undefined;
+            if (!(error instanceof OutcomeUnknown)) state.error = message(error);
           }
-          state.promptId = undefined;
-          if (!(error instanceof OutcomeUnknown)) state.error = message(error);
-        }
-      } else if (state.submitUnknown) {
-        const q = await this.adapters.comfy.queue();
-        if (q.running.length || q.pending.length) { state.phase = 'recovery_required'; state.state = 'recovery_required'; await this.persist(state); return this.publicState(state); }
-        state.error = 'Unknown submission was not retried; ComfyUI queue is empty during explicit recovery';
-        await this.cleanup(state, 'failed');
+        } else if (state.submitUnknown) {
+          const q = await this.adapters.comfy.queue();
+          if (q.running.length || q.pending.length) { state.phase = 'recovery_required'; state.state = 'recovery_required'; await this.persist(state); return this.publicState(state); }
+          state.error = 'Unknown submission was not retried; ComfyUI queue is empty during explicit recovery';
+          await this.cleanup(state, 'failed');
+          return this.publicState(state);
+        } else if (!state.state) state.state = 'failed';
+        const recoveredState = state.state === 'cancelled' ? 'cancelled' : state.completed.length === state.workflows.length ? 'complete' : 'failed';
+        if (recoveredState === 'complete') state.error = undefined;
+        else if (recoveredState === 'failed' && !state.error) state.error = 'Interrupted batch; remaining workflows were not submitted';
+        await this.cleanup(state, recoveredState);
         return this.publicState(state);
-      } else if (!state.state) state.state = 'failed';
-      const recoveredState = state.state === 'cancelled' ? 'cancelled' : state.completed.length === state.workflows.length ? 'complete' : 'failed';
-      if (recoveredState === 'complete') state.error = undefined;
-      else if (recoveredState === 'failed' && !state.error) state.error = 'Interrupted batch; remaining workflows were not submitted';
-      await this.cleanup(state, recoveredState);
-      return this.publicState(state);
+      } catch (error) {
+        state.state = 'recovery_required'; state.phase = 'recovery_required'; state.error = `Recovery failed: ${message(error)}`;
+        await this.persist(state);
+        return this.publicState(state);
+      }
     });
   }
 

@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { createHash } from 'node:crypto';
-import { loadConfig, saveManagerUrl } from './config.js';
+import { loadConfig, matchingLlamaUrl, saveManagerUrl } from './config.js';
 import { ComfyClient } from './comfy.js';
 import { ManagerClient, ManagerHttpError, type RunState } from './manager-client.js';
 import { projectFile, readProjectJson, writeProjectJson } from './files.js';
@@ -12,6 +12,7 @@ const text = (value: unknown): { content: [{ type: 'text'; text: string }]; deta
 const TERMINAL = new Set(['complete', 'failed', 'cancelled']);
 interface LocalRun { version: 1; id: string; startedAt: number; downloaded: Record<string, string> }
 interface Runtime { manager: ManagerClient; comfy: ComfyClient }
+type AuthContext = { modelRegistry?: { getProviderAuth?: (provider: string) => Promise<{ auth?: { apiKey?: string; baseUrl?: string }; env?: Record<string, string> } | undefined> } };
 
 export default function extension(pi: ExtensionAPI): void {
   const runtimes = new Map<string, Runtime>();
@@ -28,12 +29,31 @@ export default function extension(pi: ExtensionAPI): void {
     return value;
   };
 
+  const refreshAuth = async (ctx: AuthContext, cwd: string, client = runtime(cwd)) => {
+    const fallback = loadConfig(cwd).apiKey;
+    let apiKey = fallback;
+    try {
+      const auth = await ctx.modelRegistry?.getProviderAuth?.('llama.cpp');
+      const key = auth?.auth?.apiKey;
+      if (key && key !== 'local') {
+        const llamaUrl = auth?.env?.LLAMA_BASE_URL;
+        const matches = llamaUrl !== undefined
+          ? matchingLlamaUrl(client.manager.baseUrl, llamaUrl)
+          : matchingLlamaUrl(client.manager.baseUrl, auth?.auth?.baseUrl, true);
+        if (matches) apiKey = key;
+      }
+    } catch { /* Keep using the explicitly configured manager token. */ }
+    client.manager.setApiKey(apiKey);
+    client.comfy.setApiKey(apiKey);
+    return client;
+  };
+
   pi.registerTool({
     name: 'comfy_upload', label: 'Upload ComfyUI input', executionMode: 'sequential',
     description: 'Upload a project-local input file through the VRAM manager. Use the returned name and subfolder in workflow inputs.',
     parameters: Type.Object({ path: Type.String() }),
     async execute(_id, args, _signal, _update, ctx) {
-      const client = runtime(ctx.cwd);
+      const client = await refreshAuth(ctx, ctx.cwd);
       return text(await client.comfy.uploadInput(await projectFile(ctx.cwd, args.path)));
     },
   });
@@ -42,7 +62,7 @@ export default function extension(pi: ExtensionAPI): void {
     description: 'List available ComfyUI node classes, or inspect one class and its inputs/model choices.',
     parameters: Type.Object({ nodeClass: Type.Optional(Type.String()) }),
     async execute(_id, args, _signal, _update, ctx) {
-      const info = await runtime(ctx.cwd).comfy.objectInfo();
+      const info = await (await refreshAuth(ctx, ctx.cwd)).comfy.objectInfo();
       if (args.nodeClass) {
         if (!Object.hasOwn(info, args.nodeClass)) throw new Error(`Unknown node class: ${args.nodeClass}`);
         return text(info[args.nodeClass]);
@@ -75,7 +95,7 @@ export default function extension(pi: ExtensionAPI): void {
     description: 'Validate an API-format workflow against live ComfyUI node definitions and model choices.',
     parameters: Type.Object({ path: Type.String() }),
     async execute(_id, args, _signal, _update, ctx) {
-      return text(validateApiWorkflow(await readProjectJson(ctx.cwd, args.path), await runtime(ctx.cwd).comfy.objectInfo()));
+      return text(validateApiWorkflow(await readProjectJson(ctx.cwd, args.path), await (await refreshAuth(ctx, ctx.cwd)).comfy.objectInfo()));
     },
   });
   pi.registerTool({
@@ -84,7 +104,7 @@ export default function extension(pi: ExtensionAPI): void {
     promptGuidelines: ['Inspect node definitions and validate the workflow first.', 'Use exact installed model filenames and prepare inputs before generation.', 'Do not call ComfyUI or llama-server endpoints directly.'],
     parameters: Type.Object({ path: Type.Optional(Type.String()), paths: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: 32 })) }),
     async execute(toolCallId, args, signal, onUpdate, ctx) {
-      const { manager, comfy } = runtime(ctx.cwd);
+      const { manager, comfy } = await refreshAuth(ctx, ctx.cwd);
       if (Boolean(args.path) === Boolean(args.paths)) throw new Error('Specify exactly one of path or paths');
       const local = await manager.readLocalRun<LocalRun>();
       if (local) throw new Error(`A previous run ${local.id} needs /comfy resume or /comfy recover before generating`);
@@ -141,24 +161,28 @@ export default function extension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand('comfy', {
-    description: 'VRAM manager: status | cancel | recover | resume | connect [MODEL_ID] | setup',
+    description: 'VRAM manager: status | cancel | recover | resume | connect [MODEL_ID] | setup | reset',
     async handler(args, ctx) {
       try {
         const [command = 'status', id] = args.trim().split(/\s+/);
-        if (command === 'setup') {
+        if (command === 'setup' || command === 'reset') {
           if (!ctx.hasUI) throw new Error('Interactive setup requires Pi UI mode');
           const initial = runtime(ctx.cwd);
+          await refreshAuth(ctx, ctx.cwd, initial);
           await ensureSetupAllowed(ctx, initial);
           const config = loadConfig(ctx.cwd);
-          const value = await ctx.ui.input(`VRAM manager URL (Enter: ${config.managerUrl})`, config.managerUrl);
+          const defaultUrl = 'http://127.0.0.1:8090';
+          const value = command === 'reset'
+            ? await ctx.ui.input(`VRAM manager URL (Enter resets to ${defaultUrl})`, '')
+            : await ctx.ui.input(`VRAM manager URL (Enter: ${config.managerUrl})`, config.managerUrl);
           if (value === undefined) return;
           await ensureSetupAllowed(ctx, initial);
-          await saveManagerUrl(ctx.cwd, value.trim() || config.managerUrl);
+          await saveManagerUrl(ctx.cwd, value.trim() || (command === 'reset' ? defaultUrl : config.managerUrl));
           runtimes.delete(ctx.cwd);
-          ctx.ui.notify('VRAM manager接続先を保存しました。新しい設定を使用します。', 'info');
+          ctx.ui.notify('VRAM manager接続先を保存しました。llama.cppのログインURLも変更する場合は /login llama.cpp を実行してください。', 'info');
           return;
         }
-        const { manager } = runtime(ctx.cwd);
+        const { manager } = await refreshAuth(ctx, ctx.cwd);
         let result: unknown;
         if (command === 'status') result = await manager.status();
         else if (command === 'cancel') result = await manager.cancel(id);
@@ -187,14 +211,14 @@ export default function extension(pi: ExtensionAPI): void {
           }
         }
         else if (command === 'connect') result = await manager.connect(id ?? ctx.model?.id);
-        else throw new Error('Usage: /comfy status | cancel | recover | resume | connect [MODEL_ID] | setup');
+        else throw new Error('Usage: /comfy status | cancel | recover | resume | connect [MODEL_ID] | setup | reset');
         ctx.ui.notify(JSON.stringify(result, null, 2), 'info');
       } catch (error) { ctx.ui.notify(errorMessage(error), 'error'); }
     },
   });
 
   pi.on('input', async (_event, ctx) => {
-    const manager = runtime(ctx.cwd).manager;
+    const manager = (await refreshAuth(ctx, ctx.cwd)).manager;
     const local = await manager.readLocalRun<LocalRun>();
     let state: RunState;
     try { state = await manager.status(); }

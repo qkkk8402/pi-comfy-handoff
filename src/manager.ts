@@ -36,7 +36,7 @@ function sendJson(res: ServerResponse, status: number, value: unknown): void {
 }
 
 function sendError(res: ServerResponse, status: number, message: string): void {
-  sendJson(res, status, { error: message });
+  sendJson(res, status, { error: { message } });
 }
 
 class HttpError extends Error {
@@ -195,19 +195,29 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
     if (base === config.comfyuiUrl && config.comfyApiKey) headers.set('authorization', `Bearer ${config.comfyApiKey}`);
     const hasBody = req.method !== 'GET' && req.method !== 'HEAD';
     const body = hasBody ? Readable.toWeb(req) as ReadableStream<Uint8Array> : undefined;
-    const response = await fetchImpl(withPrefix(base, path), {
-      method: req.method,
-      headers,
-      body,
-      ...(body ? { duplex: 'half' } as RequestInit : {}),
-      redirect: 'error',
-    });
+    let response: Response;
+    const upstreamUrl = withPrefix(base, path);
+    try {
+      response = await fetchImpl(upstreamUrl, {
+        method: req.method,
+        headers,
+        body,
+        ...(body ? { duplex: 'half' } as RequestInit : {}),
+        redirect: 'error',
+      });
+    } catch (error) {
+      const endpoint = new URL(upstreamUrl);
+      const detail = error instanceof Error ? error.message : String(error);
+      const cause = (error as Error & { cause?: NodeJS.ErrnoException })?.cause;
+      const code = (error as NodeJS.ErrnoException)?.code ?? cause?.code;
+      throw new Error(`${req.method} ${endpoint.origin}${endpoint.pathname} request to upstream failed${code ? ` (${code})` : ''}: ${detail}`);
+    }
     await pipeResponse(response, res, keepReading);
   };
 
   const proxyInference = async (req: IncomingMessage, res: ServerResponse, path: string): Promise<void> => {
     if (!ready || !acceptingInference || transition || !authMatches(req, config.token)) {
-      sendJson(res, 503, { error: 'LLM inference is paused while GPU models are switching' });
+      sendError(res, 503, 'LLM inference is paused while GPU models are switching');
       return;
     }
     inFlight++;
@@ -216,7 +226,7 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
   };
 
   const modelOperation = async (operation: 'load' | 'unload', name: unknown, res: ServerResponse): Promise<void> => {
-    if (transition || runner.isBusy) { sendError(res, 409, 'A GPU operation is already active'); return; }
+    if (transition || runner.isBusy) { sendError(res, 409, `Cannot ${operation} llama.cpp model${typeof name === 'string' ? ` "${name}"` : ''}: a GPU operation is already active`); return; }
     if (typeof name !== 'string' || !name.trim()) { sendError(res, 400, 'model is required'); return; }
     transition = 'model'; acceptingInference = false;
     try {
@@ -240,7 +250,7 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
       sendJson(res, 200, { success: true, model: name, status: operation === 'load' ? 'loaded' : 'unloaded' });
     } catch (error) {
       acceptingInference = false; transition = undefined;
-      sendError(res, 409, error instanceof Error ? error.message : String(error));
+      sendError(res, 409, `Cannot ${operation} llama.cpp model "${name}": ${error instanceof Error ? error.message : String(error)}`);
     }
   };
 

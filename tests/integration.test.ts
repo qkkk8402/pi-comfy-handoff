@@ -127,6 +127,172 @@ test('/comfy setup changes one manager URL, keeps other settings, and applies it
   } finally { await Promise.all([oldServer, newServer].map(close)); await rm(cwd, { recursive: true, force: true }); }
 });
 
+test('/comfy reset replaces an unreachable manager URL interactively and keeps project settings', async () => {
+  await mkdir('work', { recursive: true });
+  const cwd = await mkdtemp(join(process.cwd(), 'work', 'manager-reset-'));
+  const calls: string[] = [];
+  const server = createServer((req, res) => {
+    calls.push(req.url ?? ''); res.setHeader('content-type', 'application/json');
+    if (req.url === '/comfy/object_info') res.end('{"Fixture":{}}');
+    else { res.statusCode = 404; res.end('{}'); }
+  });
+  try {
+    const newUrl = await listen(server);
+    await mkdir(join(cwd, '.pi'), { recursive: true });
+    const config = join(cwd, '.pi/comfyui.json');
+    await writeFile(config, JSON.stringify({ managerUrl: 'http://127.0.0.1:1', outputDir: 'renders', stateDir: '.saved-state' }));
+    const { commands, tools } = register();
+    const answers: Array<string | undefined> = [newUrl];
+    const ctx = { cwd, hasUI: true, isIdle: () => true, model: undefined,
+      ui: { input: async () => answers.shift(), notify() {}, setStatus() {} } };
+
+    await commands.get('comfy').handler('reset', ctx);
+
+    assert.deepEqual(JSON.parse(await readFile(config, 'utf8')), { managerUrl: newUrl, outputDir: 'renders', stateDir: '.saved-state' });
+    await tools.get('comfy_inspect').execute('new', {}, undefined, undefined, ctx);
+    assert.deepEqual(calls, ['/comfy/object_info']);
+  } finally { await close(server); await rm(cwd, { recursive: true, force: true }); }
+});
+
+test('/comfy reset Enter restores the default URL and Esc leaves the saved connection unchanged', async () => {
+  await mkdir('work', { recursive: true });
+  const cwd = await mkdtemp(join(process.cwd(), 'work', 'manager-reset-default-'));
+  try {
+    await mkdir(join(cwd, '.pi'), { recursive: true });
+    const config = join(cwd, '.pi/comfyui.json');
+    const original = { managerUrl: 'https://old.example.test/manager', outputDir: 'renders' };
+    await writeFile(config, JSON.stringify(original));
+    const { commands } = register();
+    const answers: Array<string | undefined> = ['', undefined];
+    const ctx = { cwd, hasUI: true, isIdle: () => true, model: undefined,
+      ui: { input: async () => answers.shift(), notify() {}, setStatus() {} } };
+
+    await commands.get('comfy').handler('reset', ctx);
+    assert.equal(JSON.parse(await readFile(config, 'utf8')).managerUrl, 'http://127.0.0.1:8090');
+    await writeFile(config, JSON.stringify(original));
+    await commands.get('comfy').handler('reset', ctx);
+    assert.deepEqual(JSON.parse(await readFile(config, 'utf8')), original);
+  } finally { await rm(cwd, { recursive: true, force: true }); }
+});
+
+test('/comfy reset preserves connection while a saved generation needs recovery', async () => {
+  await mkdir('work', { recursive: true });
+  const cwd = await mkdtemp(join(process.cwd(), 'work', 'manager-reset-active-'));
+  try {
+    await mkdir(join(cwd, '.pi/comfy-state'), { recursive: true });
+    const config = join(cwd, '.pi/comfyui.json');
+    const original = { managerUrl: 'http://127.0.0.1:1', outputDir: 'renders' };
+    await writeFile(config, JSON.stringify(original));
+    await writeFile(join(cwd, '.pi/comfy-state/manager-run.json'), JSON.stringify({ id: 'unfinished' }));
+    const { commands } = register();
+    let prompted = false;
+    const ctx = { cwd, hasUI: true, isIdle: () => true, model: undefined,
+      ui: { input: async () => { prompted = true; return 'http://new.example.test'; }, notify() {}, setStatus() {} } };
+
+    await commands.get('comfy').handler('reset', ctx);
+
+    assert.equal(prompted, false);
+    assert.deepEqual(JSON.parse(await readFile(config, 'utf8')), original);
+  } finally { await rm(cwd, { recursive: true, force: true }); }
+});
+
+test('Comfy and manager auth follows matching llama.cpp login, refreshes logout, and never leaks to a different URL', async () => {
+  await mkdir('work', { recursive: true });
+  const cwd = await mkdtemp(join(process.cwd(), 'work', 'manager-auth-'));
+  const envName = 'PI_COMFY_AUTH_INTEGRATION_TOKEN';
+  const previousEnv = process.env[envName];
+  delete process.env[envName];
+  let expectedToken = '';
+  const seen: Array<{ path: string; authorization: string | undefined }> = [];
+  const server = createServer((req, res) => {
+    const authorization = req.headers.authorization;
+    seen.push({ path: req.url ?? '', authorization });
+    if (!authorization || authorization !== `Bearer ${expectedToken}`) {
+      res.statusCode = 401; res.setHeader('content-type', 'application/json'); res.end('{"error":"Bearer token required"}'); return;
+    }
+    res.setHeader('content-type', 'application/json');
+    if (req.url === '/status') res.end('{"state":"idle","phase":"idle"}');
+    else if (req.url === '/comfy/object_info') res.end('{"Fixture":{}}');
+    else if (req.url === '/comfy/upload/image') res.end('{"name":"input.png","subfolder":"","type":"input"}');
+    else { res.statusCode = 404; res.end('{}'); }
+  });
+  let auth: any;
+  try {
+    const managerUrl = await listen(server);
+    await mkdir(join(cwd, '.pi'), { recursive: true });
+    await writeFile(join(cwd, '.pi/comfyui.json'), JSON.stringify({ managerUrl, apiKeyEnv: envName }));
+    await writeFile(join(cwd, 'input.png'), 'input-pixels');
+    const { tools, commands } = register();
+    const notifications: string[] = [];
+    const ctx = {
+      cwd, hasUI: true, isIdle: () => true, model: undefined, abort() {}, signal: undefined,
+      modelRegistry: { async getProviderAuth(provider: string) { assert.equal(provider, 'llama.cpp'); return auth; } },
+      ui: { notify(message: string) { notifications.push(message); }, async input() { return undefined; }, setStatus() {} },
+    };
+    const inspect = () => tools.get('comfy_inspect').execute('auth-inspect', {}, undefined, undefined, ctx);
+    const lastRequest = () => seen.at(-1)!;
+
+    // The provider-scoped URL takes precedence over auth.baseUrl.
+    expectedToken = 'login-one';
+    auth = { auth: { apiKey: 'login-one', baseUrl: 'http://elsewhere.invalid/llama/v1' }, env: { LLAMA_BASE_URL: `${managerUrl}/llama` } };
+    await inspect();
+    assert.equal(lastRequest().authorization, 'Bearer login-one');
+    await commands.get('comfy').handler('status', ctx);
+    assert.equal(lastRequest().path, '/status');
+    assert.equal(lastRequest().authorization, 'Bearer login-one');
+    await tools.get('comfy_upload').execute('auth-upload', { path: 'input.png' }, undefined, undefined, ctx);
+    assert.equal(lastRequest().path, '/comfy/upload/image');
+    assert.equal(lastRequest().authorization, 'Bearer login-one');
+
+    // A new Pi login key is picked up by the next operation.
+    expectedToken = 'login-two';
+    auth = { auth: { apiKey: 'login-two' }, env: { LLAMA_BASE_URL: `${managerUrl}/llama` } };
+    await inspect();
+    assert.equal(lastRequest().authorization, 'Bearer login-two');
+
+    // With no login auth, the previous key is cleared instead of being cached.
+    auth = undefined;
+    await assert.rejects(inspect(), /HTTP 401/);
+    assert.equal(lastRequest().authorization, undefined);
+
+    // Matching auth.baseUrl is supported when provider-scoped LLAMA_BASE_URL is absent.
+    expectedToken = 'base-url-key';
+    auth = { auth: { apiKey: 'base-url-key', baseUrl: `${managerUrl}/llama/v1` } };
+    await inspect();
+    assert.equal(lastRequest().authorization, 'Bearer base-url-key');
+
+    // Similar-looking or otherwise different endpoints must not receive the login key.
+    const parsed = new URL(managerUrl);
+    const otherPort = Number(parsed.port) + 1;
+    const mismatches = [
+      `http://localhost:${parsed.port}/llama`,
+      `http://127.0.0.1:${otherPort}/llama`,
+      `${managerUrl}/prefix/llama`,
+      `${managerUrl}/llama-extra`,
+      `https://127.0.0.1:${parsed.port}/llama`,
+    ];
+    for (const llamaUrl of mismatches) {
+      auth = { auth: { apiKey: 'must-not-leak', baseUrl: `${managerUrl}/llama/v1` }, env: { LLAMA_BASE_URL: llamaUrl } };
+      await assert.rejects(inspect(), /HTTP 401/);
+      assert.equal(lastRequest().authorization, undefined, `login key leaked for ${llamaUrl}`);
+    }
+
+    // Pi's default local sentinel is not a bearer credential; explicit manager env auth remains a fallback.
+    expectedToken = 'explicit-manager-token';
+    auth = { auth: { apiKey: 'local' }, env: { LLAMA_BASE_URL: `${managerUrl}/llama` } };
+    await assert.rejects(inspect(), /HTTP 401/);
+    assert.equal(lastRequest().authorization, undefined);
+    process.env[envName] = 'explicit-manager-token';
+    auth = { auth: { apiKey: 'foreign-login-key' }, env: { LLAMA_BASE_URL: 'https://elsewhere.invalid/llama' } };
+    await inspect();
+    assert.equal(lastRequest().authorization, 'Bearer explicit-manager-token');
+    assert.ok(notifications.some(message => message.includes('idle')));
+  } finally {
+    if (previousEnv === undefined) delete process.env[envName]; else process.env[envName] = previousEnv;
+    await close(server); await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 async function managerLocal(cwd: string): Promise<unknown> {
   try { return JSON.parse(await readFile(join(cwd, '.pi/comfy-state/manager-run.json'), 'utf8')); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error; }

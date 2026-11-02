@@ -124,6 +124,35 @@ test('unknown prompt status remains unresolved while queued and explicit empty-q
   });
 });
 
+test('failed recovery persists a retryable recovery_required state without loading or resubmitting', async () => {
+  await setup(async (runner, llama, comfy) => {
+    comfy.wait = async () => { throw new OutcomeUnknown('connection lost'); };
+    const initial = await runner.generate([workflow]);
+    assert.equal(initial.state, 'recovery_required');
+    const submissions = comfy.calls.filter(value => value.startsWith('submit:')).length;
+    const queue = comfy.queue.bind(comfy);
+    comfy.queue = async () => { throw new Error('ComfyUI is unavailable'); };
+
+    const failedRecovery = await runner.recover();
+    assert.equal(failedRecovery.state, 'recovery_required');
+    assert.equal(failedRecovery.phase, 'recovery_required');
+    assert.match(failedRecovery.error ?? '', /Recovery failed: ComfyUI is unavailable/);
+    assert.deepEqual(await runner.status(), failedRecovery);
+    assert.equal(llama.models[0]!.status, 'unloaded');
+    assert.equal(comfy.calls.filter(value => value.startsWith('submit:')).length, submissions);
+
+    comfy.queue = queue;
+    comfy.wait = async promptId => {
+      comfy.q.running = [];
+      return { promptId, outputs: [`${promptId}.png`] };
+    };
+    const retried = await runner.recover();
+    assert.equal(retried.state, 'complete');
+    assert.equal(llama.models[0]!.status, 'loaded');
+    assert.equal(comfy.calls.filter(value => value.startsWith('submit:')).length, submissions);
+  });
+});
+
 test('restarting a runner preserves unresolved state and rejects changed endpoints', async () => {
   await setup(async (runner, llama, comfy, config) => {
     comfy.unknown = true;

@@ -157,7 +157,7 @@ test('a rejected preflight can be retried with the same job ID after loading the
     const request = { id: 'retryable-job', modelId: 'fixture-model', workflows: [{ '1': { class_type: 'SaveImage', inputs: {} } }] };
     const failed = await fetch(`${base}/generate`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request) });
     assert.equal(failed.status, 409, 'preflight failure is explicitly not accepted');
-    assert.match((await failed.json() as any).error, /unloaded/);
+    assert.match((await failed.json() as any).error.message, /unloaded/);
 
     const loaded = await fetch(`${base}/llama/models/load`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'fixture-model' }) });
     assert.equal(loaded.status, 200);

@@ -107,7 +107,8 @@ export class LlamaRouterClient implements LlamaAdapter {
 
   private async request(path: string, init: RequestInit = {}): Promise<any> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error('request timeout')), this.requestMs);
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; controller.abort(new Error('request timeout')); }, this.requestMs);
     try {
       const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
         ...init,
@@ -122,14 +123,19 @@ export class LlamaRouterClient implements LlamaAdapter {
         catch { throw new LlamaRouterError(`${path} returned invalid JSON`); }
       }
       if (!response.ok) {
-        const message = body?.error?.message ?? body?.error ?? text ?? response.statusText;
+        const message = typeof body?.error === 'string' ? body.error
+          : typeof body?.error?.message === 'string' ? body.error.message
+            : typeof body?.message === 'string' ? body.message : text || response.statusText;
         throw new LlamaRouterError(`${path} failed (${response.status}): ${String(message)}`);
       }
       return body;
     } catch (error) {
       if (error instanceof LlamaRouterError) throw error;
-      if (controller.signal.aborted) throw new LlamaRouterError(`${path} timed out after ${this.requestMs}ms`);
-      throw new LlamaRouterError(`${path} request failed: ${error instanceof Error ? error.message : String(error)}`);
+      const target = new URL(`${this.baseUrl}${path}`);
+      if (controller.signal.aborted || timedOut) throw new LlamaRouterError(`Request to llama-server at ${target.origin}${target.pathname} timed out after ${this.requestMs}ms`);
+      const detail = error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300);
+      const code = (error as Error & { cause?: NodeJS.ErrnoException })?.cause?.code;
+      throw new LlamaRouterError(`Cannot reach llama-server at ${target.origin}${target.pathname}${code ? ` (${code})` : ''}: ${detail}. Check that the server is running and the URL, port, and network are correct.`);
     } finally {
       clearTimeout(timer);
     }

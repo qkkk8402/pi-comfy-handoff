@@ -20,6 +20,22 @@ export function apiUrl(value: unknown, name: string): string {
   return url.toString().replace(/\/+$/, '');
 }
 
+/** Return the llama.cpp native API URL that belongs to this manager, if it matches exactly. */
+export function matchingLlamaUrl(managerUrl: string, value: unknown, providerBaseUrl = false): boolean {
+  if (typeof value !== 'string' || !value.trim()) return false;
+  try {
+    let expected = new URL(`${apiUrl(managerUrl, 'Manager URL')}/llama`);
+    let actual = new URL(apiUrl(value, 'llama.cpp URL'));
+    if (providerBaseUrl) {
+      if (!actual.pathname.endsWith('/v1')) return false;
+      actual.pathname = actual.pathname.slice(0, -3).replace(/\/$/, '');
+    }
+    expected.pathname = expected.pathname.replace(/\/$/, '');
+    actual.pathname = actual.pathname.replace(/\/$/, '');
+    return expected.origin === actual.origin && expected.pathname === actual.pathname;
+  } catch { return false; }
+}
+
 function integer(value: unknown, fallback: number, name: string): number {
   const result = value ?? fallback;
   if (typeof result !== 'number' || !Number.isSafeInteger(result) || result <= 0) throw new Error(`${name} must be a positive integer`);

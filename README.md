@@ -10,7 +10,7 @@ Pi ── 推論・生成要求 ──> VRAM管理プロセス
 
 ## GPUホストの準備
 
-Node.js 22以上が必要です。llama-serverとComfyUIは、管理プロセスと同じGPUホストで起動してください。
+Node.js 22.19.0以上が必要です。llama-serverとComfyUIは、管理プロセスと同じGPUホストで起動してください。
 
 ```bash
 llama-server --models-dir /path/to/models --no-models-autoload
@@ -39,7 +39,7 @@ npm run manager -- --host 127.0.0.1 --port 8090 \
 ```
 
 すべてのオプションは`npm run manager -- --help`で確認できます。起動オプションはJSON設定より優先され、JSON設定は既定値より優先されます。JSONを使う場合は`--config manager.json`を指定します。
-別ホストからPiを接続する場合は`--host`に公開するインターフェースを指定し、16文字以上の`COMFY_MANAGER_TOKEN`をホストとPiの両方で設定してください。VRAM設定が必要な場合は`--gpu`と`--min-free-mib`を追加できます。
+別ホストからPiを接続する場合は`--host`に公開するインターフェースを指定し、ホスト側に16文字以上の`COMFY_MANAGER_TOKEN`を設定し、Piの`/login llama.cpp`で同じトークンを入力してください。VRAM設定が必要な場合は`--gpu`と`--min-free-mib`を追加できます。
 
 ```json
 {
@@ -52,7 +52,7 @@ npm run manager -- --host 127.0.0.1 --port 8090 \
 
 AMDではGPU指定に`"gpu": "card1"`、NVIDIAではインデックスやUUIDを使います。対象GPUが1枚なら自動検出します。`minFreeMiB`でLLM復帰時に必要な空きVRAMを指定できます。
 
-別マシンから接続する場合は`listenHost`を変更し、環境変数`COMFY_MANAGER_TOKEN`を設定してください。Pi側では同じトークンを`COMFY_MANAGER_TOKEN`として設定します。Piの`/login llama.cpp`では、このトークンをAPIキーとして入力します。ネットワークの準備は利用環境側で行います。
+`COMFY_MANAGER_TOKEN`を設定すると、管理プロセスへの接続にBearer認証を要求します。Piでは`/login llama.cpp`に管理プロセス用のトークンを入力してください。Pi側の`COMFY_MANAGER_TOKEN`設定は通常不要で、Piのログイン認証が一致する管理プロセスへ自動で共有されます。別ホストから接続する場合のネットワーク準備は利用環境側で行います。
 
 llama-serverやComfyUI自身に認証を設定した場合、ホスト側の`LLAMA_API_KEY`・`COMFYUI_API_KEY`にそれぞれ設定します。
 
@@ -78,9 +78,10 @@ Piの推論接続も管理プロセスに向けます。
 4. `/comfy setup`で管理プロセスのURL`http://GPU_HOST:8090`を登録する。
 
 同一ホストなら`GPU_HOST`は`127.0.0.1`です。llama-serverへ直接接続すると、管理プロセスの推論制御を経由しません。
+`/login llama.cpp`で保存したAPIキーは、認証時の`LLAMA_BASE_URL`が管理プロセスの`/llama`エンドポイントと一致するとき、ComfyUI操作にも自動で使われます。接続先が異なる場合はPiの認証キーを送らず、必要なら`COMFY_MANAGER_TOKEN`（または`apiKeyEnv`で指定した環境変数）を使います。同じ接続先ではPiのログインキーを優先し、未ログイン時は環境変数へフォールバックします。
 初回の生成前に、Piの推論モデルを`/llama`でロードしてください。モデルが未ロードの生成要求は受理されず、同じ要求IDで再試行する前にモデルをロードする必要があります。
 
-`/comfy setup`はプロジェクトの`.pi/comfyui.json`へ保存し、再起動なしで反映します。空Enterは現在値を維持し、Escは保存せず終了します。生成中・復旧待ちの接続変更は拒否します。
+`/comfy setup`はプロジェクトの`.pi/comfyui.json`へ保存し、再起動なしで反映します。空Enterは現在値を維持し、Escは保存せず終了します。接続先を登録し直す場合は`/comfy reset`を実行し、新しい管理プロセスURLを入力します。空Enterで既定の`http://127.0.0.1:8090`に戻せます。どちらも生成中・復旧待ちの接続変更は拒否し、生成の復旧記録や他のプロジェクト設定は保持します。llama.cppのログインURLも変更する場合は、別途`/login llama.cpp`を実行してください。
 
 JSONで設定する場合:
 

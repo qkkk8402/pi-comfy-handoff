@@ -26,7 +26,15 @@ export interface ComfyClientOptions {
 
 export class ComfyHttpError extends Error {
   constructor(readonly endpoint: string, readonly status: number, readonly responseBody: string) {
-    super(`ComfyUI ${endpoint} returned HTTP ${status}: ${responseBody.slice(0, 1000)}`);
+    let detail = responseBody.slice(0, 1000);
+    try {
+      const body = JSON.parse(responseBody);
+      const error = body?.error;
+      if (typeof error === 'string') detail = error;
+      else if (typeof error?.message === 'string') detail = error.message;
+      else if (typeof body?.message === 'string') detail = body.message;
+    } catch { /* Keep the bounded response text for non-JSON errors. */ }
+    super(`ComfyUI ${endpoint} returned HTTP ${status}: ${detail.slice(0, 1000)}`);
     this.name = "ComfyHttpError";
   }
 }
@@ -146,6 +154,12 @@ export class ComfyClient implements ComfyAdapter {
     if (!Number.isSafeInteger(this.options.generationMs) || this.options.generationMs < 0) throw new Error('generationMs must be a nonnegative integer (0 means no deadline)');
   }
 
+  setApiKey(apiKey: string | undefined): void {
+    const next = apiKey ?? "";
+    if (this.options.apiKey !== next) this.objectInfoCache = undefined;
+    this.options.apiKey = next;
+  }
+
   private endpoint(path: string): string {
     return `${this.baseUrl}${path.startsWith("/") ? path : `/${path}`}`;
   }
@@ -170,7 +184,10 @@ export class ComfyClient implements ComfyAdapter {
       if (timer) clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
       if (controller.signal.aborted) throw controller.signal.reason ?? error;
-      throw error;
+      const detail = error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300);
+      const code = (error as Error & { cause?: NodeJS.ErrnoException })?.cause?.code;
+      const target = new URL(this.endpoint(path));
+      throw new Error(`Cannot reach ComfyUI at ${target.origin}${target.pathname}${code ? ` (${code})` : ''}: ${detail}. Check that the VRAM manager and ComfyUI are running and their URLs, ports, and network are correct.`);
     }
   }
 
