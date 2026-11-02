@@ -1,0 +1,14 @@
+node_modules/
+dist/
+work/
+.pi/comfyui.json
+.pi/comfy-state/
+outputs/
+*.log
+/AGENTS.md
+/.agents/
+/.codex/
+/.aws/
+.env
+.env.*
+!.env.example
