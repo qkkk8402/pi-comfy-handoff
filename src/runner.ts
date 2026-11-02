@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { ComfyAdapter, DirectConfig, GenerationResult, LlamaAdapter, ModelState, Workflow } from './types.js';
+import type { ComfyAdapter, HostConfig, GenerationResult, LlamaAdapter, ModelState, Workflow } from './types.js';
 import { OutcomeUnknown } from './types.js';
 
 export interface RunState {
@@ -19,6 +19,7 @@ export interface RunnerOptions {
   onProgress?: (value: unknown) => void;
   modelId?: string;
   idempotencyKey?: string;
+  onAccepted?: (state: RunState) => Promise<void> | void;
 }
 type Snapshot = ModelState[];
 type Journal = RunState & { version: 1; comfyuiUrl: string; llamaServerUrl: string; snapshot: Snapshot; workflows: Workflow[]; index: number; submitUnknown?: boolean; cancelledPromptId?: string };
@@ -32,7 +33,7 @@ export class Runner {
   private cancellation?: { id: string; promise: Promise<void> };
   private writes: Promise<void> = Promise.resolve();
   private readonly journalPath: string;
-  constructor(private readonly config: DirectConfig, private readonly adapters: { llama: LlamaAdapter; comfy: ComfyAdapter }) {
+  constructor(private readonly config: HostConfig, private readonly adapters: { llama: LlamaAdapter; comfy: ComfyAdapter; waitForVramRelease?: (minFreeMiB?: number) => Promise<void> }) {
     this.journalPath = join(config.stateDir, 'runner-state.json');
   }
 
@@ -52,8 +53,17 @@ export class Runner {
   }
 
   async status(): Promise<RunState | { state: 'idle'; phase: 'idle' }> {
+    if (this.active) await this.writes;
     const state = this.active ? this.current : await this.readJournal();
     return state ? this.publicState(state) : { state: 'idle', phase: 'idle' };
+  }
+
+  async markInterrupted(): Promise<void> {
+    const journal = await this.readJournal();
+    if (!journal || TERMINAL.has(journal.state) || journal.state === 'recovery_required') return;
+    journal.phase = 'recovery_required'; journal.state = 'recovery_required';
+    journal.error = 'Manager restarted during this generation; explicit recovery is required';
+    await this.persist(journal);
   }
 
   async generate(workflows: Workflow[], options: RunnerOptions = {}): Promise<RunState> {
@@ -64,6 +74,7 @@ export class Runner {
       const id = options.idempotencyKey || randomUUID();
       if (prior?.id === id) {
         if (JSON.stringify(prior.workflows) !== JSON.stringify(workflows)) throw new Error('The same call ID was used with different workflows');
+        await options.onAccepted?.(this.publicState(prior));
         return this.publicState(prior);
       }
       const models = await this.adapters.llama.listModels();
@@ -79,12 +90,15 @@ export class Runner {
       };
       this.current = journal; this.cancelRequested = false; this.confirmedCancellations.clear();
       await this.persist(journal);
+      await options.onAccepted?.(this.publicState(journal));
       try {
         await this.ensureComfyIdle();
         if (options.signal?.aborted || this.cancelRequested) throw new CancelRequested();
         if (target.status === 'loaded') {
           journal.phase = 'unloading_llm'; await this.persist(journal);
           await this.adapters.llama.unload(target.name);
+          if (this.adapters.waitForVramRelease) await this.adapters.waitForVramRelease();
+          else if (this.adapters.comfy.waitForRelease) await this.adapters.comfy.waitForRelease();
         }
         journal.phase = 'generating'; await this.persist(journal);
         for (let i = 0; i < workflows.length; i++) {
@@ -213,7 +227,10 @@ export class Runner {
       await this.adapters.comfy.free();
       const observed = await this.adapters.llama.listModels();
       const needsLoad = state.snapshot.some(model => model.status === 'loaded' && observed.find(item => item.name === model.name)?.status !== 'loaded');
-      if (this.adapters.comfy.waitForRelease) await this.adapters.comfy.waitForRelease(needsLoad ? this.config.minFreeMiB : undefined);
+      if (needsLoad) {
+        if (this.adapters.waitForVramRelease) await this.adapters.waitForVramRelease(this.config.minFreeMiB);
+        else if (this.adapters.comfy.waitForRelease) await this.adapters.comfy.waitForRelease(this.config.minFreeMiB);
+      }
       state.phase = 'restoring_llm'; await this.persist(state);
       for (const model of state.snapshot) {
         if (model.status === 'loaded') {

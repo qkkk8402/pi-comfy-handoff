@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 import { Runner } from '../src/runner.js';
-import { OutcomeUnknown, type ComfyAdapter, type DirectConfig, type LlamaAdapter, type ModelState, type QueueState, type Workflow } from '../src/types.js';
+import { OutcomeUnknown, type ComfyAdapter, type HostConfig, type LlamaAdapter, type ModelState, type QueueState, type Workflow } from '../src/types.js';
 
 const workflow: Workflow = { '1': { class_type: 'EmptyLatentImage', inputs: { width: 512 } } };
 class Llama implements LlamaAdapter {
@@ -27,10 +27,10 @@ class Comfy implements ComfyAdapter {
   async free() { this.calls.push('free'); }
   async waitForRelease() { this.calls.push('released'); }
 }
-async function setup(fn: (runner: Runner, llama: Llama, comfy: Comfy, config: DirectConfig) => Promise<void>) {
+async function setup(fn: (runner: Runner, llama: Llama, comfy: Comfy, config: HostConfig) => Promise<void>) {
   const stateDir = await mkdtemp(join(process.cwd(), 'work', 'runner-test-'));
   try {
-    const config: DirectConfig = { comfyuiUrl: 'http://127.0.0.1:8188', llamaServerUrl: 'http://127.0.0.1:8080', outputDir: '', stateDir, timeouts: { requestMs: 100, modelMs: 100, generationMs: 100, settleMs: 100, pollMs: 1 } };
+    const config: HostConfig = { comfyuiUrl: 'http://127.0.0.1:8188', llamaServerUrl: 'http://127.0.0.1:8080', stateDir, timeouts: { requestMs: 100, modelMs: 100, generationMs: 100, settleMs: 100, pollMs: 1 } };
     const llama = new Llama(); const comfy = new Comfy(); await fn(new Runner(config, { llama, comfy }), llama, comfy, config);
   } finally { await rm(stateDir, { recursive: true, force: true }); }
 }
@@ -40,15 +40,20 @@ test('single and batch generation unloads once, frees ComfyUI, then restores the
     const state = await runner.generate([workflow, workflow]);
     assert.equal(state.state, 'complete'); assert.equal(state.completed.length, 2);
     assert.deepEqual(llama.calls, ['unload:pi-model', 'load:pi-model']);
-    assert.deepEqual(comfy.calls.filter(x => x === 'free' || x === 'released'), ['free', 'released']);
+    assert.deepEqual(comfy.calls.filter(x => x === 'free' || x === 'released'), ['released', 'free', 'released']);
     assert.deepEqual((await runner.status()).state, 'complete');
   });
 });
 
 test('a release failure leaves the LLM unloaded until explicit recovery succeeds', async () => {
   await setup(async (runner, llama, comfy) => {
+    let releases = 0;
     const release = comfy.waitForRelease.bind(comfy);
-    comfy.waitForRelease = async () => { throw new OutcomeUnknown('memory state unavailable'); };
+    comfy.waitForRelease = async () => {
+      releases++;
+      if (releases === 2) throw new OutcomeUnknown('memory state unavailable after ComfyUI release');
+      await release();
+    };
     const result = await runner.generate([workflow]);
     assert.equal(result.state, 'recovery_required');
     assert.equal(llama.models[0]!.status, 'unloaded');

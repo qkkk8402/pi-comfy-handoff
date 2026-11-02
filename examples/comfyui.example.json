@@ -1,4 +1,9 @@
 {
-  "comfyuiUrl": "http://127.0.0.1:8188",
-  "llamaServerUrl": "http://127.0.0.1:8080"
+  "managerUrl": "http://127.0.0.1:8090",
+  "outputDir": "outputs/comfy",
+  "stateDir": ".pi/comfy-state",
+  "timeouts": {
+    "requestMs": 30000,
+    "pollMs": 1000
+  }
 }

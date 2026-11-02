@@ -1,7 +1,7 @@
-/** Small, strict ComfyUI API client for direct Pi extension use. */
+/** ComfyUI HTTP API client. */
 
 import { createReadStream } from "node:fs";
-import { lstat, mkdir, open, stat, unlink } from "node:fs/promises";
+import { link as hardLink, lstat, mkdir, open, stat, unlink } from "node:fs/promises";
 import { basename, isAbsolute, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import { Transform } from "node:stream";
@@ -140,9 +140,10 @@ export class ComfyClient implements ComfyAdapter {
       apiKey: options.apiKey ?? "",
       settleMs: options.settleMs ?? 30_000,
     };
-    for (const name of ["requestMs", "generationMs", "pollMs", "unknownGraceMs", "maxJsonBytes", "maxOutputBytes", "maxInputBytes", "settleMs"] as const) {
+    for (const name of ["requestMs", "pollMs", "unknownGraceMs", "maxJsonBytes", "maxOutputBytes", "maxInputBytes", "settleMs"] as const) {
       if (!Number.isSafeInteger(this.options[name]) || this.options[name] < 1) throw new Error(`${name} must be a positive integer`);
     }
+    if (!Number.isSafeInteger(this.options.generationMs) || this.options.generationMs < 0) throw new Error('generationMs must be a nonnegative integer (0 means no deadline)');
   }
 
   private endpoint(path: string): string {
@@ -151,7 +152,7 @@ export class ComfyClient implements ComfyAdapter {
 
   private async fetchResponse(path: string, init: RequestInit = {}, timeoutMs = this.options.requestMs): Promise<Response> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error(`ComfyUI request timed out: ${path}`)), timeoutMs);
+    const timer = timeoutMs === 0 ? undefined : setTimeout(() => controller.abort(new Error(`ComfyUI request timed out: ${path}`)), timeoutMs);
     const signal = init.signal;
     const onAbort = () => controller.abort(signal?.reason);
     if (signal?.aborted) onAbort();
@@ -161,12 +162,12 @@ export class ComfyClient implements ComfyAdapter {
       if (this.options.apiKey) headers.set("authorization", `Bearer ${this.options.apiKey}`);
       const response = await fetch(this.endpoint(path), { ...init, headers, redirect: "error", signal: controller.signal });
       this.responseCleanup.set(response, () => {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         signal?.removeEventListener("abort", onAbort);
       });
       return response;
     } catch (error) {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
       if (controller.signal.aborted) throw controller.signal.reason ?? error;
       throw error;
@@ -331,7 +332,7 @@ export class ComfyClient implements ComfyAdapter {
     validId(promptId, "prompt ID");
     const started = Date.now();
     let absentSince: number | undefined;
-    while (Date.now() - started < this.options.generationMs) {
+    while (this.options.generationMs === 0 || Date.now() - started < this.options.generationMs) {
       if (signal?.aborted) throw new OutcomeUnknown(`Waiting for ${promptId} stopped while its ComfyUI state may still be active`);
       let entry: HistoryEntry | undefined;
       try { entry = await this.history(promptId); }
@@ -409,7 +410,7 @@ export class ComfyClient implements ComfyAdapter {
   }
 
   private async waitUntilQueueAbsent(promptId: string, action: string): Promise<void> {
-    const deadline = Date.now() + this.options.generationMs;
+    const deadline = this.options.generationMs === 0 ? Number.POSITIVE_INFINITY : Date.now() + this.options.generationMs;
     while (Date.now() < deadline) {
       const queue = await this.queue();
       if (!queue.running.includes(promptId) && !queue.pending.includes(promptId)) return;
@@ -450,7 +451,7 @@ export class ComfyClient implements ComfyAdapter {
     throw new OutcomeUnknown("Timed out waiting for ComfyUI GPU memory release; the API did not confirm stable headroom");
   }
 
-  private async downloadOutput(
+  async downloadOutput(
     promptId: string,
     file: { nodeId: string; filename: string; subfolder: string; type: string },
     index: number,
@@ -470,6 +471,7 @@ export class ComfyClient implements ComfyAdapter {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
+    const temporary = resolve(outputDir, `.${randomUUID()}.partial`);
     const response = await this.fetchResponse(`/view?${params.toString()}`, { signal }, this.options.generationMs);
     let created = false;
     try {
@@ -486,12 +488,19 @@ export class ComfyClient implements ComfyAdapter {
           else callback(null, chunk);
         },
       });
-      const handle = await open(target, "wx", 0o600);
+      const handle = await open(temporary, "wx", 0o600);
       created = true;
       await pipeline(Readable.fromWeb(response.body as import("node:stream/web").ReadableStream), limiter,
         handle.createWriteStream({ autoClose: true }));
+      try { await hardLink(temporary, target); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`Output file already exists: ${target}`);
+        throw error;
+      }
+      await unlink(temporary);
+      created = false;
     } catch (error) {
-      if (created) await unlink(target).catch(() => undefined);
+      if (created) await unlink(temporary).catch(() => undefined);
       throw error;
     } finally { this.finishResponse(response); }
     return { ...file, path: target, viewUrl };

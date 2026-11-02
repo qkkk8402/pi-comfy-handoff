@@ -1,0 +1,105 @@
+import { randomUUID } from 'node:crypto';
+import { mkdir, rename, unlink, writeFile, readFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import type { ClientConfig } from './config.js';
+import type { Workflow } from './types.js';
+
+export interface OutputRef { nodeId: string; filename: string; subfolder: string; type: string }
+export interface RunState {
+  id?: string;
+  state: 'idle' | 'running' | 'complete' | 'failed' | 'cancelled' | 'recovery_required';
+  phase?: string;
+  completed?: Array<{ promptId: string; outputs: OutputRef[] }>;
+  error?: string;
+  [key: string]: unknown;
+}
+export interface GenerateRequest { id: string; modelId?: string; workflows: Workflow[] }
+
+export class ManagerHttpError extends Error {
+  constructor(readonly status: number, message: string) { super(`VRAM manager returned HTTP ${status}: ${message}`); }
+}
+
+export class ManagerClient {
+  readonly baseUrl: string;
+  constructor(readonly config: ClientConfig, private readonly fetchImpl: typeof fetch = fetch) {
+    this.baseUrl = config.managerUrl;
+  }
+
+  async status(): Promise<RunState> {
+    const value = await this.json('/status');
+    if (!value || typeof value !== 'object' || Array.isArray(value) || typeof value.state !== 'string') {
+      throw new Error('VRAM manager /status returned an invalid state');
+    }
+    return value as RunState;
+  }
+
+  async generate(request: GenerateRequest, signal?: AbortSignal): Promise<RunState> {
+    return await this.json('/generate', { method: 'POST', body: JSON.stringify(request), signal }) as RunState;
+  }
+
+  async cancel(id?: string): Promise<RunState> {
+    return await this.json('/cancel', { method: 'POST', body: JSON.stringify(id ? { id } : {}) }) as RunState;
+  }
+
+  async recover(id?: string): Promise<RunState> {
+    return await this.json('/recover', { method: 'POST', body: JSON.stringify(id ? { id } : {}) }) as RunState;
+  }
+
+  async connect(modelId?: string): Promise<unknown> {
+    return await this.json('/connect', { method: 'POST', body: JSON.stringify(modelId ? { modelId } : {}) });
+  }
+
+  async statePath(): Promise<string> {
+    const path = join(this.config.stateDir, 'manager-run.json');
+    await mkdir(dirname(path), { recursive: true });
+    return path;
+  }
+
+  async saveLocalRun(value: unknown): Promise<void> {
+    const path = await this.statePath();
+    const temp = `${path}.${randomUUID()}.tmp`;
+    await writeFile(temp, `${JSON.stringify(value, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+    await rename(temp, path);
+  }
+
+  async readLocalRun<T>(): Promise<T | undefined> {
+    const path = await this.statePath();
+    try { return JSON.parse(await readFile(path, 'utf8')) as T; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error; }
+  }
+
+  async clearLocalRun(): Promise<void> {
+    const path = await this.statePath();
+    await unlink(path).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; });
+  }
+
+  private async json(path: string, init: RequestInit = {}): Promise<any> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.config.timeouts.requestMs);
+    const headers = new Headers(init.headers);
+    headers.set('accept', 'application/json');
+    if (init.body && !headers.has('content-type') && typeof init.body === 'string') headers.set('content-type', 'application/json');
+    if (this.config.apiKey) headers.set('authorization', `Bearer ${this.config.apiKey}`);
+    const external = init.signal;
+    const onAbort = () => controller.abort(external?.reason);
+    if (external?.aborted) onAbort(); else external?.addEventListener('abort', onAbort, { once: true });
+    try {
+      const response = await this.fetchImpl(`${this.baseUrl}${path}`, { ...init, headers, redirect: 'error', signal: controller.signal });
+      const body = await response.text();
+      let value: any;
+      try { value = body ? JSON.parse(body) : undefined; }
+      catch {
+        if (!response.ok) throw new ManagerHttpError(response.status, body.slice(0, 1000) || response.statusText);
+        throw new Error(`VRAM manager ${path} returned invalid JSON`);
+      }
+      if (!response.ok) throw new ManagerHttpError(response.status, String(value?.error ?? value?.message ?? body ?? response.statusText));
+      return value;
+    } catch (error) {
+      if (controller.signal.aborted) throw controller.signal.reason ?? error;
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      external?.removeEventListener('abort', onAbort);
+    }
+  }
+}

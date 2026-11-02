@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import { ComfyCancelError, ComfyClient } from "../src/comfy.js";
@@ -77,6 +77,33 @@ test("waits for exact prompt history and returns output references", async () =>
     assert.equal(output.nodeId, "2");
     assert.equal(output.filename, "cat.png");
     assert.match(output.viewUrl, /filename=cat.png/);
+  });
+});
+
+test("waits for long-running generations when generationMs is zero", async () => {
+  let polls = 0;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  await serve(async (req, res) => {
+    if (req.url === "/history/prompt-1") {
+      polls++;
+      if (polls === 1) await gate;
+      sendJson(res, polls < 2 ? {} : { "prompt-1": { status: { status_str: "success", completed: true }, outputs: {} } });
+      return;
+    }
+    if (req.url === "/queue") { sendJson(res, { queue_running: [[0, "prompt-1"]], queue_pending: [] }); return; }
+    sendJson(res, {}, 404);
+  }, async (baseUrl) => {
+    const client = new ComfyClient(baseUrl, { pollMs: 1, generationMs: 0 });
+    const waiting = client.wait("prompt-1");
+    try {
+      while (polls === 0) await new Promise(resolve => setTimeout(resolve, 1));
+      await new Promise(resolve => setTimeout(resolve, 5));
+      assert.equal(polls, 1, "the request remains pending without a generation deadline");
+    } finally { release(); }
+    const result = await waiting;
+    assert.equal(result.promptId, "prompt-1");
+    assert.equal(polls, 2);
   });
 });
 
@@ -273,4 +300,20 @@ test("does not overwrite or delete an existing output file", async () => {
       assert.equal((await readFile(existing, "utf8")), "keep");
     });
   } finally { await rm(outputDir, { recursive: true, force: true }); }
+});
+
+test("removes incomplete downloaded output when the transfer is interrupted", async () => {
+  const cwd = await mkdtemp(join(process.cwd(), "work", "comfy-download-interrupted-"));
+  const outputDir = join(cwd, "outputs");
+  try {
+    await serve((_req, res) => {
+      res.writeHead(200, { "content-type": "application/octet-stream", "content-length": "100000" });
+      res.write(Buffer.alloc(32));
+      setTimeout(() => res.destroy(), 5);
+    }, async (baseUrl) => {
+      const client = new ComfyClient(baseUrl, { outputDir });
+      await assert.rejects(client.downloadOutput("prompt", { nodeId: "1", filename: "partial.png", subfolder: "", type: "output" }, 0));
+      assert.deepEqual(await readdir(outputDir), [], "partial data must not look like a completed output file");
+    });
+  } finally { await rm(cwd, { recursive: true, force: true }); }
 });

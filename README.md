@@ -1,128 +1,143 @@
 # pi-comfy-handoff
 
-Pi coding agent の拡張から ComfyUI のワークフローを編集し、画像・動画を生成します。Pi は `llama-server` に接続し、拡張は両サーバーの HTTP API を直接呼び出します。
+Pi coding agentからComfyUIのワークフローを編集し、画像・動画を生成します。GPUホストの管理プロセスがllama-serverとComfyUIのモデル切替を担当します。Piは同じホストでも、別マシン・仮想OSでも実行できます。
 
 ```text
-Pi ──推論────────────────────> llama-server
-  └─拡張 ──モデル解放・復帰──> llama-server API
-          └─編集・検証・生成──> ComfyUI API
+Pi ── 推論・生成要求 ──> VRAM管理プロセス
+                          ├─ llama-server
+                          └─ ComfyUI
 ```
 
-## 前提
+## GPUホストの準備
 
-- Node.js 22以上と Pi coding agent。
-- モデルのロード・アンロードAPIを提供する llama.cpp `llama-server`。
-- ComfyUI の HTTP API。生成中に同じGPUを使う他クライアントが操作しない運用。
-- Pi から両方のAPIへ接続できること。ローカル、別マシン、仮想OSのいずれでも、到達可能なURLを設定します。
-
-接続先サーバーの準備とネットワーク設定は利用環境側で行います。llama-serverのrouterモードを使い、拡張がLLMとComfyUIのモデルを交互にロードします。
-
-## セットアップ
-
-### 1. インストール
-
-```bash
-pi install git:github.com/qkkk8402/pi-comfy-handoff
-```
-
-ソースから開発する場合:
-
-```bash
-npm ci
-npm run build
-```
-
-### 2. サーバー起動
-
-llama-server の router モードで自動ロードを無効にします。使用している llama.cpp 版でオプションとモデル管理APIを確認してください。
+Node.js 22以上が必要です。llama-serverとComfyUIは、管理プロセスと同じGPUホストで起動してください。
 
 ```bash
 llama-server --models-dir /path/to/models --no-models-autoload
 ```
 
-モデルIDは `GET /models` が返す値を使います。ComfyUIも通常どおり起動してください。
+管理プロセスはllama-serverのrouter APIを使います。両サーバーは通常どおり別途起動し、Piからの推論と生成は管理プロセスを経由させます。同じGPUを使う他クライアントの同時操作は避けてください。
 
-### 3. Piの推論先を設定
-
-Piを起動し、`/login llama.cpp` を実行してllama-serverのURL `http://127.0.0.1:8080` を登録します。次に `/llama` でモデルをロードし、`/model` でそのモデルを選ぶとPiが推論に使います。
-
-### 4. 拡張の接続先を設定
-
-プロジェクト内で `/comfy setup` を実行し、ComfyUIとllama-serverのURLを順番に入力します。ここでのllama-server URLはモデル管理用APIの接続先です。Piの推論接続とは別に保存されます。空のままEnterを押すと現在値を保ち、入力をキャンセルすると保存しません。接続先は保存後すぐ反映され、Piの再起動は不要です。
-
-JSONを直接編集する場合は、Piを実行するプロジェクトの `.pi/comfyui.json` に2つのURLを設定して、Piを再起動してください。
-
-```json
-{
-  "comfyuiUrl": "http://127.0.0.1:8188",
-  "llamaServerUrl": "http://127.0.0.1:8080"
-}
-```
-
-別マシンや仮想OSでは、Piから到達できるホスト名/IPアドレスとポートを指定します。URLはネイティブAPIのルートを指定します（リバースプロキシのパスprefixは使用可能です）。llama-serverのURLに推論用の `/v1` は付けません。拡張が必要なAPIパスを追加します。
-
-任意設定を使う場合:
-
-```json
-{
-  "comfyuiUrl": "http://127.0.0.1:8188",
-  "llamaServerUrl": "http://127.0.0.1:8080",
-  "outputDir": "outputs/comfy",
-  "stateDir": ".pi/comfy-state",
-  "llamaModel": "MODEL_ID",
-  "minFreeMiB": 1024
-}
-```
-
-`outputDir`と`stateDir`はPi側のパスです。対象モデルは利用中のPiモデルIDを使用し、PiのIDがない場合は `llamaModel` または一意にロードされているモデルから解決します。認証が必要なら、環境変数 `COMFYUI_API_KEY`、`LLAMA_API_KEY` にBearerトークンを設定します。別の変数名を使う場合は設定の `comfyApiKeyEnv`、`llamaApiKeyEnv` で指定できます。`timeouts` には `requestMs`、`modelMs`、`generationMs`、`settleMs`、`pollMs` を任意設定できます。
-
-Pi側でAPIキーを `/login llama.cpp` に登録した場合、拡張用のキーは別途 `LLAMA_API_KEY` 環境変数にも設定してください。ComfyUIのキーは `COMFYUI_API_KEY` に設定します。Piの推論URLには `/v1` が使われますが、`/comfy setup` には `http://127.0.0.1:8080` のようなAPIルートを入力します。
-
-ソースから直接使う場合は、拡張を指定して起動します。
+リポジトリを取得して管理プロセスを起動します。
 
 ```bash
-pi -e /path/to/pi-extension/src/extension.ts
+git clone https://github.com/qkkk8402/pi-comfy-handoff.git
+cd pi-comfy-handoff
+npm ci
+npm run build
+npm run manager
 ```
 
-モデルが未ロードなら、LLMを使わないコマンドで接続・初期ロードします。
+既定値は管理プロセスが`127.0.0.1:8090`、llama-serverが`http://127.0.0.1:8080`、ComfyUIが`http://127.0.0.1:8188`です。
 
-```text
-/comfy connect MODEL_ID
+起動時オプションで接続先などを上書きできます。
+
+```bash
+npm run manager -- --host 127.0.0.1 --port 8090 \
+  --llama-url http://127.0.0.1:8080 \
+  --comfy-url http://127.0.0.1:8188
 ```
 
-## 使い方
+すべてのオプションは`npm run manager -- --help`で確認できます。起動オプションはJSON設定より優先され、JSON設定は既定値より優先されます。JSONを使う場合は`--config manager.json`を指定します。
+別ホストからPiを接続する場合は`--host`に公開するインターフェースを指定し、16文字以上の`COMFY_MANAGER_TOKEN`をホストとPiの両方で設定してください。VRAM設定が必要な場合は`--gpu`と`--min-free-mib`を追加できます。
 
-拡張はノード仕様の取得、API形式ワークフローの作成・編集・検証、入力ファイルのアップロード、画像・動画の生成を提供します。ワークフローはPi側プロジェクトのJSONとして保存します。ComfyUI画面のキャンバス形式との同期・自動変換や、モデルのダウンロードは行いません。
+```json
+{
+  "listenHost": "127.0.0.1",
+  "listenPort": 8090,
+  "llamaServerUrl": "http://127.0.0.1:8080",
+  "comfyuiUrl": "http://127.0.0.1:8188"
+}
+```
 
-生成例:
+AMDではGPU指定に`"gpu": "card1"`、NVIDIAではインデックスやUUIDを使います。対象GPUが1枚なら自動検出します。`minFreeMiB`でLLM復帰時に必要な空きVRAMを指定できます。
 
-> ComfyUIのノード仕様を確認して、workflows/portrait.jsonをAPI形式で作成してください。検証後に生成し、出力ファイルの保存先を教えてください。
+別マシンから接続する場合は`listenHost`を変更し、環境変数`COMFY_MANAGER_TOKEN`を設定してください。Pi側では同じトークンを`COMFY_MANAGER_TOKEN`として設定します。Piの`/login llama.cpp`では、このトークンをAPIキーとして入力します。ネットワークの準備は利用環境側で行います。
 
-生成時は、Piのツール処理がLLM推論を一時停止し、拡張が対象モデルをアンロードしてComfyUIへジョブを送ります。完了後にComfyUIへ解放を要求し、APIから確認できる状態を待ってからLLMをロードします。モデル復帰を確認した後で結果をPi側へ返します。バッチ生成では同じ切替をまとめて行います。
+llama-serverやComfyUI自身に認証を設定した場合、ホスト側の`LLAMA_API_KEY`・`COMFYUI_API_KEY`にそれぞれ設定します。
 
-ComfyUIの生成結果はAPI経由でPi側の `outputDir` に保存します。入力ファイルもPi側からアップロードします。共有フォルダーやホスト側パスへのアクセスは必要ありません。
+## Piの設定
 
-## コマンドと復旧
+拡張をインストールします。
 
-生成の前後に、LLMを使わず状態確認や復旧を行えます。
+```bash
+pi install git:github.com/qkkk8402/pi-comfy-handoff
+```
+
+ソースを直接使う場合は、Piを次のように起動できます。
+
+```bash
+pi -e /path/to/pi-comfy-handoff/src/extension.ts
+```
+
+Piの推論接続も管理プロセスに向けます。
+
+1. `/login llama.cpp`で`http://GPU_HOST:8090/llama`を登録する。
+2. `/llama`でモデルをロードする。
+3. `/model`で使用するモデルを選択する。
+4. `/comfy setup`で管理プロセスのURL`http://GPU_HOST:8090`を登録する。
+
+同一ホストなら`GPU_HOST`は`127.0.0.1`です。llama-serverへ直接接続すると、管理プロセスの推論制御を経由しません。
+初回の生成前に、Piの推論モデルを`/llama`でロードしてください。モデルが未ロードの生成要求は受理されず、同じ要求IDで再試行する前にモデルをロードする必要があります。
+
+`/comfy setup`はプロジェクトの`.pi/comfyui.json`へ保存し、再起動なしで反映します。空Enterは現在値を維持し、Escは保存せず終了します。生成中・復旧待ちの接続変更は拒否します。
+
+JSONで設定する場合:
+
+```json
+{
+  "managerUrl": "http://127.0.0.1:8090",
+  "outputDir": "outputs/comfy"
+}
+```
+
+`outputDir`と`stateDir`はPi側のパスです。`apiKeyEnv`でトークンを読む環境変数名を変更できます。JSONを手編集した場合はPiを再起動してください。
+
+## ワークフローと生成
+
+Pi拡張はノード仕様の取得、API形式ワークフローの作成・編集・検証、入力ファイルのアップロード、生成と出力ダウンロードを提供します。ワークフローはPi側プロジェクト内のJSONです。ComfyUI画面のキャンバス形式との同期や、モデルのダウンロードは対象外です。
+
+例:
+
+> ComfyUIのノード仕様を確認して、workflows/portrait.jsonをAPI形式で作成してください。検証して生成し、出力の保存先を教えてください。
+
+生成要求はホスト側へ保存してから実行します。管理プロセスは新しい推論を止め、実行中の推論終了を確認し、LLMを解放して生成します。完了後にComfyUIを解放し、メモリ確認とLLM復帰を終えてから推論を再開します。
+
+Piは短いHTTP要求で状態を繰り返し確認します。待機時間全体の上限は設けず、進捗を表示します。一時的な接続失敗では待機を継続します。待機中にPiの中断操作を行っても、ホストの生成は取り消しません。
+
+生成結果は管理プロセス経由でPi側の`outputDir`へ保存します。共有フォルダーは不要です。
+
+## 状態確認・再開・復旧
 
 ```text
 /comfy status
+/comfy resume
 /comfy cancel
 /comfy recover
+/comfy connect MODEL_ID
 ```
 
-`/comfy status` は保存された実行状態を表示します。`/comfy connect MODEL_ID` はllama-serverへモデルをロードします。生成失敗・キャンセル後は、対象ジョブが停止したことを確認してから解放とモデル復帰を行います。生成POSTの応答が不明な場合は二重生成を避けるため自動再送せず、状態を保存して手動復旧を求めます。明示的なrecoverでqueueが空と確認できた場合は解放と復帰を試みますが、結果不明の生成を成功扱いにしたり再実行したりしません。
+- `status`: ホスト側の状態を確認します。
+- `resume`: 保存した実行IDで待機と出力取得を再開します。生成は再送しません。
+- `cancel`: ホスト側へ明示的に生成の取り消しを依頼します。
+- `recover`: 状態不明の実行を確認し、解放・LLM復帰を試みます。
+- `connect`: 指定LLMモデルをロードします。
 
-Piや仮想OSを強制終了した場合、サーバー側の後始末は保証されません。再起動後に `/comfy status` で状態を確認し、必要なら `/comfy recover` を実行します。サーバーの起動・停止やネットワーク復旧は拡張では行いません。
+Piの終了や通信切断によってホストの生成を取り消しません。Pi再起動後は`/comfy resume`を使えます。OS・外部ツールによるPiプロセスの強制終了そのものを防ぐ機能はありません。
 
-## VRAMとGPU
+管理プロセスが再起動した場合、未完了の実行は復旧待ちとし、生成を自動再送しません。状態が不明な間は推論と新しい生成を拒否します。
 
-LLMはllama-serverのモデル管理API、生成モデルはComfyUI APIで切り替えます。ComfyUIの `/system_stats` などから利用可能なVRAM情報を確認します。`/free`の成功応答だけでは、GPUメモリが解放されたとは判断しません。
+## VRAMの確認
 
-メモリ確認には、CUDA/ROCmでComfyUIが `type: cuda` として提供する統計を使用します。未対応・不正な統計ではLLM復帰を見送って復旧待ちになります。統計の安定だけでは必要な空き容量を保証しないため、必要に応じて `minFreeMiB` を設定します。APIだけでカスタムノード等の全メモリ解放を保証することはできません。
+ホスト側でGPU全体の総容量・使用量・空き容量を取得します。
 
-AMD Radeon RX 7900 XTX / ROCm上で、llama-serverのモデルをアンロードし、ComfyUIでSDXLの512×512画像を1枚生成した後、llama-serverのモデルを復帰させて推論できることを確認しました。動作確認用に2ステップで生成しています。動画生成、キャンセル、障害復旧は実GPUで未確認です。モックHTTPサーバーによるテストも実施しています。
+- AMD/Linux: `amdgpu`ドライバーのsysfsを読み取ります。
+- NVIDIA: `nvidia-smi`で取得します。
+- ホスト統計を取得できない環境: ComfyUIのGPU統計を使います。
+
+ホスト統計が利用できる場合は取得元と数値を状態表示に含めます。選択済みのホスト統計が途中で取得できなくなった場合は切替を止めます。モデルの解放状態、キュー、メモリ統計の安定と、設定されていれば空き容量の閾値を確認します。統計の安定だけでOOMを完全に防ぐことはできません。
+
+AMD実機では、SDXLの512×512画像を8・64・192 stepsで生成し、その後のQwenモデル復帰と推論を確認しました。この確認は拡張のテストハーネスを使っており、Pi UIからの操作確認ではありません。NVIDIA実機では未確認です。
 
 ## 開発
 

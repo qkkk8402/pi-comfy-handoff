@@ -18,11 +18,17 @@ export interface ComfyAdapter {
   free(): Promise<void>;
   waitForRelease?(minFreeMiB?: number): Promise<void>;
 }
-export interface DirectConfig {
+export interface HostConfig {
   comfyuiUrl: string; llamaServerUrl: string;
-  outputDir: string; stateDir: string;
+  stateDir: string;
   llamaModel?: string; comfyApiKey?: string; llamaApiKey?: string;
   minFreeMiB?: number;
   timeouts: { requestMs: number; modelMs: number; generationMs: number; settleMs: number; pollMs: number };
+}
+export interface ManagerConfig extends HostConfig {
+  listenHost: string;
+  listenPort: number;
+  gpu?: string;
+  token?: string;
 }
 export class OutcomeUnknown extends Error { override name = 'OutcomeUnknown'; }

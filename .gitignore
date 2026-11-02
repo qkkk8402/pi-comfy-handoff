@@ -12,3 +12,7 @@ outputs/
 .env
 .env.*
 !.env.example
+
+.pi-comfy-manager/
+manager.json
+comfy-manager.json
