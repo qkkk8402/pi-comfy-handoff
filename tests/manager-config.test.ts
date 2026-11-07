@@ -11,6 +11,10 @@ test('manager defaults to loopback and disables unbounded LLM autoload behavior'
   assert.equal(config.comfyuiUrl, 'http://127.0.0.1:8188');
   assert.equal(config.llamaServerUrl, 'http://127.0.0.1:8080');
   assert.equal(config.stateDir, '/host/.pi-comfy-manager');
+  assert.equal(config.logLevel, 'info');
+  assert.equal(parseManagerConfig({ logLevel: 'debug' }).logLevel, 'debug');
+  assert.throws(() => parseManagerConfig({ logLevel: 'trace' }), /logLevel/);
+  assert.throws(() => parseManagerConfig({ logLevel: ['info'] }), /logLevel/);
   assert.equal(config.timeouts.generationMs, 0);
 });
 
@@ -30,7 +34,7 @@ test('manager CLI options override JSON while preserving unoverridden values', (
   try {
     const file = join(dir, 'manager.json');
     writeFileSync(file, JSON.stringify({ listenHost: '0.0.0.0', listenPort: 9000, minFreeMiB: 300, timeouts: { requestMs: 5000, modelMs: 6000 } }));
-    const args = parseManagerArgs(['--config', file, '--host', '127.0.0.1', '--port', '8091', '--poll-ms', '250']);
+    const args = parseManagerArgs(['--config', file, '--host', '127.0.0.1', '--port', '8091', '--poll-ms', '250', '--log-level', 'debug']);
     const config = loadManagerConfig(args.configFile, dir, args.overrides);
     assert.equal(config.listenHost, '127.0.0.1');
     assert.equal(config.listenPort, 8091);
@@ -38,6 +42,7 @@ test('manager CLI options override JSON while preserving unoverridden values', (
     assert.equal(config.timeouts.requestMs, 5000);
     assert.equal(config.timeouts.modelMs, 6000);
     assert.equal(config.timeouts.pollMs, 250);
+    assert.equal(config.logLevel, 'debug');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

@@ -62,3 +62,52 @@ test('host restart blocks inference and model changes until the persisted job is
     assert.equal(stored.state, 'complete');
   } finally { await manager.close(); await rm(cwd, { recursive: true, force: true }); }
 });
+
+test('standalone cancellation of a recovered prompt reopens inference after cleanup', async () => {
+  await mkdir('work', { recursive: true });
+  const cwd = await mkdtemp(join(process.cwd(), 'work', 'host-cancel-recovery-'));
+  const config = { ...parseManagerConfig({ stateDir: cwd, timeouts: { pollMs: 1 } }, cwd, {}), listenPort: 0 };
+  let running = true;
+  let loaded = false;
+  await writeFile(join(cwd, 'runner-state.json'), JSON.stringify({
+    version: 1, id: 'cancel-job', phase: 'recovery_required', state: 'recovery_required', model: 'fixture', completed: [],
+    updatedAt: Date.now(), comfyuiUrl: config.comfyuiUrl, llamaServerUrl: config.llamaServerUrl,
+    snapshot: [{ name: 'fixture', status: 'loaded' }], workflows: [{ '1': { class_type: 'Fixture', inputs: {} } }],
+    index: 0, promptId: 'active-prompt',
+  }));
+  const manager = createManager(config, {
+    verifyAutoload: false,
+    fetchImpl: async url => String(url).endsWith('/props')
+      ? new Response('{"models_autoload":false}', { status: 200 })
+      : new Response('{}', { status: 200 }),
+    comfy: {
+      async queue() { return { running: running ? ['active-prompt'] : [], pending: [] }; },
+      async cancel() { running = false; }, async free() {},
+    } as unknown as ComfyClient,
+    llama: {
+      async listModels() { return [{ name: 'fixture', status: loaded ? 'loaded' : 'unloaded' }]; },
+      async load() { loaded = true; }, async unload() { loaded = false; },
+    } as unknown as LlamaRouterClient,
+    vram: {
+      async read() { return { source: 'amdgpu', device: 'fixture', totalMiB: 24000, usedMiB: 1000, freeMiB: 23000 }; },
+      async waitForRelease() { return { source: 'amdgpu', device: 'fixture', totalMiB: 24000, usedMiB: 1000, freeMiB: 23000 }; },
+    },
+  });
+  try {
+    await manager.start();
+    const address = manager.server.address(); assert.ok(address && typeof address !== 'string');
+    const base = `http://127.0.0.1:${address.port}`;
+    assert.equal((await fetch(`${base}/llama/v1/chat/completions`, { method: 'POST', body: '{}' })).status, 503);
+    assert.equal((await fetch(`${base}/cancel`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: 'cancel-job' }) })).status, 202);
+    let state: any;
+    for (let i = 0; i < 100; i++) {
+      state = await (await fetch(`${base}/status`)).json();
+      if (state.state === 'cancelled' && state.managerPhase === 'llm_ready') break;
+      await new Promise(resolve => setTimeout(resolve, 2));
+    }
+    assert.equal(state.state, 'cancelled');
+    assert.equal(state.managerPhase, 'llm_ready');
+    assert.equal(loaded, true);
+    assert.equal((await fetch(`${base}/llama/v1/chat/completions`, { method: 'POST', body: '{}' })).status, 200);
+  } finally { await manager.close(); await rm(cwd, { recursive: true, force: true }); }
+});

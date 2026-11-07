@@ -30,5 +30,6 @@ export interface ManagerConfig extends HostConfig {
   listenPort: number;
   gpu?: string;
   token?: string;
+  logLevel?: 'silent' | 'error' | 'info' | 'debug';
 }
 export class OutcomeUnknown extends Error { override name = 'OutcomeUnknown'; }

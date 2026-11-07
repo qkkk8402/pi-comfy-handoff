@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import { once } from 'node:events';
-import { rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { createManager } from '../src/manager.js';
 import { parseManagerConfig } from '../src/manager-config.js';
@@ -55,11 +55,14 @@ test('manager gates new inference and drains a disconnected response before unlo
     async cancel() {}, async free() { events.push('comfy-free'); },
   } as unknown as ComfyAdapter;
   const waitForRelease = deferred();
+  const logLines: string[] = [];
   const manager = createManager({
-    ...parseManagerConfig({ comfyuiUrl: comfyUrl, llamaServerUrl: llamaUrl, stateDir: join(cwd, '.state'), timeouts: { requestMs: 2_000, modelMs: 2_000, generationMs: 0, settleMs: 100, pollMs: 5 } }),
+    ...parseManagerConfig({ comfyuiUrl: comfyUrl, llamaServerUrl: llamaUrl, stateDir: join(cwd, '.state'), logLevel: 'debug', timeouts: { requestMs: 2_000, modelMs: 2_000, generationMs: 0, settleMs: 100, pollMs: 5 } }),
+    comfyApiKey: 'comfy-key-secret', llamaApiKey: 'llama-key-secret',
     listenPort: 0,
   }, {
     comfy: fakeComfy as any,
+    logSink: line => logLines.push(line),
     vram: { async read() { return { source: 'amdgpu' as const, device: 'card1', totalMiB: 24560, usedMiB: 1024, freeMiB: 23536 }; }, async waitForRelease() { events.push('vram-stable'); waitForRelease.resolve(); return { source: 'amdgpu' as const, device: 'card1', totalMiB: 24560, usedMiB: 1024, freeMiB: 23536 }; } },
   });
   try {
@@ -72,7 +75,7 @@ test('manager gates new inference and drains a disconnected response before unlo
       body: JSON.stringify({ model: 'fixture-model', messages: [{ role: 'user', content: 'hello' }] }), signal: abort.signal,
     }).catch(error => error);
     await chatStarted.promise;
-    const workflow: Workflow = { '7': { class_type: 'SaveImage', inputs: { images: ['1', 0] } } };
+    const workflow: Workflow = { '7': { class_type: 'SaveImage', inputs: { images: ['1', 0], prompt: 'PRIVATE_PROMPT_SECRET' } } };
     const accepted = await fetch(`${base}/generate`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ id: 'stable-job-id', modelId: 'fixture-model', workflows: [workflow] }),
@@ -114,10 +117,53 @@ test('manager gates new inference and drains a disconnected response before unlo
     }
     assert.equal(completed, true, 'generation and LLM restoration should finish');
     assert.equal(model, 'loaded');
+    const capturedLogs = logLines.join('\n');
+    assert.ok(logLines.some(line => line.includes('generation accepted run=stable-job-id workflows=1')));
+    assert.ok(logLines.some(line => line.includes('phase=generating')));
+    assert.ok(!capturedLogs.includes('PRIVATE_PROMPT_SECRET'));
+    assert.ok(!capturedLogs.includes('comfy-key-secret'));
+    assert.ok(!capturedLogs.includes('llama-key-secret'));
   } finally {
     finishChat.resolve();
     await manager.close();
     await close(llamaServer);
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test('model operation errors retain diagnostics while redacting configured credentials', async () => {
+  await mkdir('work', { recursive: true });
+  const cwd = await mkdtemp(join(process.cwd(), 'work', 'manager-redaction-'));
+  const secret = 'llama-key-secret';
+  const upstream = createServer((req, res) => {
+    const path = new URL(req.url ?? '/', 'http://upstream').pathname;
+    res.setHeader('content-type', 'application/json');
+    if (path === '/props') { res.end('{"models_autoload":false}'); return; }
+    if (path === '/models') { res.end('{"data":[{"id":"fixture-model","status":{"value":"unloaded"}}]}'); return; }
+    if (path === '/models/load') { res.statusCode = 500; res.end(JSON.stringify({ error: `load failed with credential ${secret}` })); return; }
+    res.statusCode = 404; res.end('{}');
+  });
+  const llamaUrl = await listen(upstream);
+  const manager = createManager({
+    ...parseManagerConfig({ comfyuiUrl: 'http://127.0.0.1:8188', llamaServerUrl: llamaUrl, stateDir: cwd, timeouts: { requestMs: 2_000, modelMs: 2_000, generationMs: 0, settleMs: 100, pollMs: 5 } }),
+    llamaApiKey: secret, listenPort: 0,
+  }, {
+    comfy: { async queue() { return { running: [], pending: [] }; }, async free() {} } as any,
+    vram: { async read() { return { source: 'amdgpu' as const, device: 'card1', totalMiB: 1000, usedMiB: 100, freeMiB: 900 }; }, async waitForRelease() { return { source: 'amdgpu' as const, device: 'card1', totalMiB: 1000, usedMiB: 100, freeMiB: 900 }; } },
+  });
+  try {
+    await manager.start();
+    const address = manager.server.address(); assert.ok(address && typeof address !== 'string');
+    for (const [path, body, status] of [['/llama/models/load', { model: 'fixture-model' }, 409], ['/connect', { modelId: 'fixture-model' }, 502]] as const) {
+      const response: Response = await fetch(`http://127.0.0.1:${address.port}${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+      assert.equal(response.status, status);
+      const message = (await response.json() as any).error.message as string;
+      assert.match(message, /load failed with credential \[redacted\]/);
+      assert.ok(!message.includes(secret));
+    }
+  } finally {
+    await manager.close();
+    await close(upstream);
     await rm(cwd, { recursive: true, force: true });
   }
 });

@@ -21,6 +21,8 @@ function endpoint(value: unknown, fallback: string, name: string): string {
 }
 
 export function parseManagerConfig(raw: Record<string, unknown>, cwd = process.cwd(), env: NodeJS.ProcessEnv = process.env): ManagerConfig {
+  const logLevel = raw.logLevel ?? 'info';
+  if (typeof logLevel !== 'string' || !['silent', 'error', 'info', 'debug'].includes(logLevel)) throw new Error('logLevel must be silent, error, info, or debug');
   const timeouts = raw.timeouts;
   if (timeouts !== undefined && (!timeouts || typeof timeouts !== 'object' || Array.isArray(timeouts))) {
     throw new Error('timeouts must be an object');
@@ -42,6 +44,7 @@ export function parseManagerConfig(raw: Record<string, unknown>, cwd = process.c
   if (gpu !== undefined && (typeof gpu !== 'string' || !gpu.trim())) throw new Error('gpu must be a device selector string');
   return {
     listenHost,
+    logLevel: logLevel as ManagerConfig['logLevel'],
     listenPort: (() => {
       const port = positiveInteger(raw.listenPort, 8090, 'listenPort');
       if (port > 65535) throw new Error('listenPort must be between 1 and 65535');
@@ -98,6 +101,7 @@ const cliOptions: Record<string, { key: string; type: 'string' | 'number' }> = {
   '--settle-ms': { key: 'settleMs', type: 'number' },
   '--poll-ms': { key: 'pollMs', type: 'number' },
   '--generation-ms': { key: 'generationMs', type: 'number' },
+  '--log-level': { key: 'logLevel', type: 'string' },
 };
 
 export function parseManagerArgs(args: string[]): ManagerCliOptions {

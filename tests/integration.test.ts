@@ -75,8 +75,8 @@ test('Pi uploads, validates, submits once, waits beyond one request timeout and 
     await writeFile(join(cwd, 'input.png'), 'input-pixels');
     const { tools, commands, events } = register();
     const statuses = new Map<string, string>();
-    const ctx = { cwd, hasUI: true, model: { id: 'fixture-model' }, abort() {}, ui: { notify() {}, setStatus(key: string, value?: string) { if (value) statuses.set(key, value); else statuses.delete(key); } } };
-    await commands.get('comfy').handler('connect fixture-model', ctx);
+    const ctx = { cwd, hasUI: true, model: { id: 'fixture-model' }, abort() {}, ui: { async select() { return 'LLMを接続（現在のモデル）'; }, notify() {}, setStatus(key: string, value?: string) { if (value) statuses.set(key, value); else statuses.delete(key); } } };
+    await commands.get('comfy').handler('', ctx);
     assert.ok(calls.includes('/connect'));
     const execute = (name: string, args: unknown, signal?: AbortSignal) => tools.get(name).execute(`call-${name}`, args, signal, undefined, ctx);
     await execute('comfy_upload', { path: 'input.png' });
@@ -97,7 +97,7 @@ test('Pi uploads, validates, submits once, waits beyond one request timeout and 
   } finally { await close(server); await rm(cwd, { recursive: true, force: true }); }
 });
 
-test('/comfy setup changes one manager URL, keeps other settings, and applies it immediately', async () => {
+test('/comfy connection menu changes one manager URL, keeps other settings, and applies it immediately', async () => {
   await mkdir('work', { recursive: true });
   const cwd = await mkdtemp(join(process.cwd(), 'work', 'manager-setup-'));
   const calls: string[] = [];
@@ -117,9 +117,9 @@ test('/comfy setup changes one manager URL, keeps other settings, and applies it
     const { commands, tools } = register();
     const answers: Array<string | undefined> = [newUrl];
     const ctx = { cwd, hasUI: true, isIdle: () => true, model: undefined,
-      ui: { input: async () => answers.shift(), notify() {}, setStatus() {} } };
+      ui: { async select(_prompt: string, options: string[]) { return options.includes('接続設定') ? '接続設定' : '接続先を変更'; }, input: async () => answers.shift(), notify() {}, setStatus() {} } };
     await tools.get('comfy_inspect').execute('old', {}, undefined, undefined, ctx);
-    await commands.get('comfy').handler('setup', ctx);
+    await commands.get('comfy').handler('', ctx);
     assert.deepEqual(JSON.parse(await readFile(config, 'utf8')), { managerUrl: newUrl, outputDir: 'renders', apiKeyEnv: 'CUSTOM', timeouts: { pollMs: 5 } });
     await tools.get('comfy_inspect').execute('new', {}, undefined, undefined, ctx);
     assert.ok(calls.includes('old:/comfy/object_info'));
@@ -127,7 +127,7 @@ test('/comfy setup changes one manager URL, keeps other settings, and applies it
   } finally { await Promise.all([oldServer, newServer].map(close)); await rm(cwd, { recursive: true, force: true }); }
 });
 
-test('/comfy reset replaces an unreachable manager URL interactively and keeps project settings', async () => {
+test('/comfy connection menu replaces an unreachable manager URL and keeps project settings', async () => {
   await mkdir('work', { recursive: true });
   const cwd = await mkdtemp(join(process.cwd(), 'work', 'manager-reset-'));
   const calls: string[] = [];
@@ -144,9 +144,9 @@ test('/comfy reset replaces an unreachable manager URL interactively and keeps p
     const { commands, tools } = register();
     const answers: Array<string | undefined> = [newUrl];
     const ctx = { cwd, hasUI: true, isIdle: () => true, model: undefined,
-      ui: { input: async () => answers.shift(), notify() {}, setStatus() {} } };
+      ui: { async select(_prompt: string, options: string[]) { return options.includes('接続設定') ? '接続設定' : '接続先を変更'; }, input: async () => answers.shift(), notify() {}, setStatus() {} } };
 
-    await commands.get('comfy').handler('reset', ctx);
+    await commands.get('comfy').handler('', ctx);
 
     assert.deepEqual(JSON.parse(await readFile(config, 'utf8')), { managerUrl: newUrl, outputDir: 'renders', stateDir: '.saved-state' });
     await tools.get('comfy_inspect').execute('new', {}, undefined, undefined, ctx);
@@ -154,7 +154,7 @@ test('/comfy reset replaces an unreachable manager URL interactively and keeps p
   } finally { await close(server); await rm(cwd, { recursive: true, force: true }); }
 });
 
-test('/comfy reset Enter restores the default URL and Esc leaves the saved connection unchanged', async () => {
+test('/comfy connection menu restores the default URL and Esc leaves it unchanged', async () => {
   await mkdir('work', { recursive: true });
   const cwd = await mkdtemp(join(process.cwd(), 'work', 'manager-reset-default-'));
   try {
@@ -164,18 +164,20 @@ test('/comfy reset Enter restores the default URL and Esc leaves the saved conne
     await writeFile(config, JSON.stringify(original));
     const { commands } = register();
     const answers: Array<string | undefined> = ['', undefined];
+    let resetMenu = true;
     const ctx = { cwd, hasUI: true, isIdle: () => true, model: undefined,
-      ui: { input: async () => answers.shift(), notify() {}, setStatus() {} } };
+      ui: { async select(_prompt: string, options: string[]) { if (options.includes('接続設定')) return '接続設定'; if (options.includes('接続先を初期値に戻す')) return resetMenu ? '接続先を初期値に戻す' : '接続先を変更'; return '戻る'; }, input: async () => answers.shift(), notify() {}, setStatus() {} } };
 
-    await commands.get('comfy').handler('reset', ctx);
+    await commands.get('comfy').handler('', ctx);
     assert.equal(JSON.parse(await readFile(config, 'utf8')).managerUrl, 'http://127.0.0.1:8090');
     await writeFile(config, JSON.stringify(original));
-    await commands.get('comfy').handler('reset', ctx);
+    resetMenu = false;
+    await commands.get('comfy').handler('', ctx);
     assert.deepEqual(JSON.parse(await readFile(config, 'utf8')), original);
   } finally { await rm(cwd, { recursive: true, force: true }); }
 });
 
-test('/comfy reset preserves connection while a saved generation needs recovery', async () => {
+test('/comfy connection menu preserves settings while a saved generation needs recovery', async () => {
   await mkdir('work', { recursive: true });
   const cwd = await mkdtemp(join(process.cwd(), 'work', 'manager-reset-active-'));
   try {
@@ -187,9 +189,9 @@ test('/comfy reset preserves connection while a saved generation needs recovery'
     const { commands } = register();
     let prompted = false;
     const ctx = { cwd, hasUI: true, isIdle: () => true, model: undefined,
-      ui: { input: async () => { prompted = true; return 'http://new.example.test'; }, notify() {}, setStatus() {} } };
+      ui: { async select(_prompt: string, options: string[]) { if (options.includes('接続設定')) return '接続設定'; return '接続先を変更'; }, input: async () => { prompted = true; return 'http://new.example.test'; }, notify() {}, setStatus() {} } };
 
-    await commands.get('comfy').handler('reset', ctx);
+    await commands.get('comfy').handler('', ctx);
 
     assert.equal(prompted, false);
     assert.deepEqual(JSON.parse(await readFile(config, 'utf8')), original);
@@ -286,7 +288,7 @@ test('Comfy and manager auth follows matching llama.cpp login, refreshes logout,
     auth = { auth: { apiKey: 'foreign-login-key' }, env: { LLAMA_BASE_URL: 'https://elsewhere.invalid/llama' } };
     await inspect();
     assert.equal(lastRequest().authorization, 'Bearer explicit-manager-token');
-    assert.ok(notifications.some(message => message.includes('idle')));
+    assert.ok(notifications.some(message => message.includes('待機中')));
   } finally {
     if (previousEnv === undefined) delete process.env[envName]; else process.env[envName] = previousEnv;
     await close(server); await rm(cwd, { recursive: true, force: true });

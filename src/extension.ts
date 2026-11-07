@@ -12,6 +12,7 @@ const text = (value: unknown): { content: [{ type: 'text'; text: string }]; deta
 const TERMINAL = new Set(['complete', 'failed', 'cancelled']);
 interface LocalRun { version: 1; id: string; startedAt: number; downloaded: Record<string, string> }
 interface Runtime { manager: ManagerClient; comfy: ComfyClient }
+interface SetupContext extends AuthContext { cwd: string; isIdle(): boolean; ui: { input(prompt: string, value: string): Promise<string | undefined>; notify(message: string, level?: string): void } }
 type AuthContext = { modelRegistry?: { getProviderAuth?: (provider: string) => Promise<{ auth?: { apiKey?: string; baseUrl?: string }; env?: Record<string, string> } | undefined> } };
 
 export default function extension(pi: ExtensionAPI): void {
@@ -100,14 +101,14 @@ export default function extension(pi: ExtensionAPI): void {
   });
   pi.registerTool({
     name: 'comfy_generate', label: 'Generate with ComfyUI', executionMode: 'sequential',
-    description: 'Submit one or more prepared API workflows through the VRAM manager. Waits for completion, downloads output to the project, and never cancels a host job when Pi waiting is interrupted. Resume with /comfy resume.',
+    description: 'Submit one or more prepared API workflows through the VRAM manager. Waits for completion, downloads output to the project, and never cancels a host job when Pi waiting is interrupted. Continue from /comfy.',
     promptGuidelines: ['Inspect node definitions and validate the workflow first.', 'Use exact installed model filenames and prepare inputs before generation.', 'Do not call ComfyUI or llama-server endpoints directly.'],
     parameters: Type.Object({ path: Type.Optional(Type.String()), paths: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: 32 })) }),
     async execute(toolCallId, args, signal, onUpdate, ctx) {
       const { manager, comfy } = await refreshAuth(ctx, ctx.cwd);
       if (Boolean(args.path) === Boolean(args.paths)) throw new Error('Specify exactly one of path or paths');
       const local = await manager.readLocalRun<LocalRun>();
-      if (local) throw new Error(`A previous run ${local.id} needs /comfy resume or /comfy recover before generating`);
+      if (local) throw new Error(`前回の生成 ${local.id} が未解決です。/comfy メニューから待機・復旧を続けてください。`);
       const paths = args.paths ?? [args.path!];
       const info = await comfy.objectInfo();
       const workflows: Workflow[] = [];
@@ -155,52 +156,95 @@ export default function extension(pi: ExtensionAPI): void {
           return { ...text({ id, state: 'failed', error: errorMessage(error) }), terminate: true };
         }
         ctx.abort();
-        return { ...text({ id, state: 'recovery_required', error: errorMessage(error), message: 'State is uncertain. Use /comfy resume or recover.' }), terminate: true };
+        return { ...text({ id, state: 'recovery_required', error: errorMessage(error), message: '状態が確定できません。/comfy メニューから待機・復旧を続けてください。' }), terminate: true };
       }
     },
   });
 
   pi.registerCommand('comfy', {
-    description: 'VRAM manager: status | cancel | recover | resume | connect [MODEL_ID] | setup | reset',
+    description: 'ComfyUIの状態確認、待機・復旧、接続設定',
     async handler(args, ctx) {
       try {
-        const [command = 'status', id] = args.trim().split(/\s+/);
-        if (command === 'setup' || command === 'reset') {
-          if (!ctx.hasUI) throw new Error('Interactive setup requires Pi UI mode');
-          const initial = runtime(ctx.cwd);
-          await refreshAuth(ctx, ctx.cwd, initial);
-          await ensureSetupAllowed(ctx, initial);
-          const config = loadConfig(ctx.cwd);
-          const defaultUrl = 'http://127.0.0.1:8090';
-          const value = command === 'reset'
-            ? await ctx.ui.input(`VRAM manager URL (Enter resets to ${defaultUrl})`, '')
-            : await ctx.ui.input(`VRAM manager URL (Enter: ${config.managerUrl})`, config.managerUrl);
-          if (value === undefined) return;
-          await ensureSetupAllowed(ctx, initial);
-          await saveManagerUrl(ctx.cwd, value.trim() || (command === 'reset' ? defaultUrl : config.managerUrl));
-          runtimes.delete(ctx.cwd);
-          ctx.ui.notify('VRAM manager接続先を保存しました。llama.cppのログインURLも変更する場合は /login llama.cpp を実行してください。', 'info');
+        const command = args.trim();
+        if (command === 'status') {
+          const { manager } = await refreshAuth(ctx, ctx.cwd);
+          const state = await manager.status();
+          const local = await manager.readLocalRun<LocalRun>();
+          ctx.ui.notify(formatComfyStatus(state, local, manager.baseUrl, ctx.model?.id), 'info');
           return;
         }
+        if (command && command !== 'status') throw new Error('使い方: /comfy（操作メニュー）または /comfy status');
+        if (!ctx.hasUI) {
+          const { manager } = await refreshAuth(ctx, ctx.cwd);
+          ctx.ui.notify(formatComfyStatus(await manager.status(), await manager.readLocalRun<LocalRun>(), manager.baseUrl, ctx.model?.id), 'info');
+          return;
+        }
+
+        // Keep menu entry available even when the manager is down so its URL can be repaired.
         const { manager } = await refreshAuth(ctx, ctx.cwd);
-        let result: unknown;
-        if (command === 'status') result = await manager.status();
-        else if (command === 'cancel') result = await manager.cancel(id);
-        else if (command === 'recover') {
-          result = await manager.recover(id);
+        const localAtOpen = await manager.readLocalRun<LocalRun>();
+        let state: RunState | undefined;
+        let statusError: string | undefined;
+        try { state = await manager.status(); } catch (error) { statusError = errorMessage(error); }
+        const lines = [formatComfyStatus(state, localAtOpen, manager.baseUrl, ctx.model?.id)];
+        if (statusError) lines.push(`接続エラー: ${statusError}`);
+        const unresolved = Boolean(localAtOpen) || (state && (busy(state) || state.state === 'recovery_required'));
+        const choices = [
+          '状態を表示',
+          ...(unresolved ? ['生成の待機・復旧を続ける'] : []),
+          ...(state && busy(state) ? ['生成をキャンセル'] : []),
+          ...(!unresolved ? ['LLMを接続（現在のモデル）'] : []),
+          '接続設定', '閉じる',
+        ];
+        const choice = await ctx.ui.select(lines.join('\n'), choices);
+        if (!choice || choice === '閉じる') return;
+        if (choice === '状態を表示') {
+          ctx.ui.notify(lines.join('\n'), statusError ? 'warning' : 'info'); return;
+        }
+        if (choice === '接続設定') {
+          const setting = await ctx.ui.select('接続設定', ['接続先を変更', '接続先を初期値に戻す', '戻る']);
+          if (setting && setting !== '戻る') {
+            await configureManagerUrl(ctx, runtime(ctx.cwd), setting === '接続先を初期値に戻す');
+            runtimes.delete(ctx.cwd);
+          }
+          return;
+        }
+        if (choice === 'LLMを接続（現在のモデル）') {
+          await manager.connect(ctx.model?.id);
+          ctx.ui.notify(`現在のモデル${ctx.model?.id ? ` (${ctx.model.id})` : ''}をLLMに接続しました。`, 'info');
+          return;
+        }
+        if (choice === '生成をキャンセル') {
+          const confirmed = await ctx.ui.select('実行中のComfyUI生成をキャンセルしますか？', ['戻る', 'キャンセルする']);
+          if (confirmed !== 'キャンセルする') return;
+          await manager.cancel(state?.id ?? localAtOpen?.id);
+          ctx.ui.notify('生成のキャンセルを依頼しました。モデルの復帰が完了するまで /comfy で状態を確認できます。', 'info');
+          return;
+        }
+        if (choice === '生成の待機・復旧を続ける') {
+          let result: unknown;
           const local = await manager.readLocalRun<LocalRun>();
-          if (local && (!id || id === local.id)) {
-            const current = await manager.status();
-            const terminal = TERMINAL.has(current.state) || current.state === 'idle';
-            if (terminal && current.id !== local.id) {
+          let current = await manager.status();
+          if (local && TERMINAL.has(current.state) && current.id === local.id) {
+            const result = await waitForRun(manager, runtime(ctx.cwd).comfy, local, current, ctx.signal, ctx);
+            notifyRunResult(ctx, result); return;
+          }
+          if (local && !busy(current) && (current.state === 'idle' || current.id !== local.id)) {
+            await manager.clearLocalRun();
+            ctx.ui.notify('ホスト側に該当する実行中の生成はありません。古いPi待機記録を削除しました。生成は再送していません。', 'info'); return;
+          }
+          if (current.state === 'recovery_required') {
+            if (local && current.id && current.id !== local.id) throw new Error(`保存された生成 ${local.id} と管理側の生成 ${current.id} が一致しません。安全のため続行を止めました。`);
+            current = await waitForRecovery(manager, await manager.recover(local?.id), ctx.signal, ctx);
+            if (local && current.id === local.id && TERMINAL.has(current.state)) {
+              const result = await waitForRun(manager, runtime(ctx.cwd).comfy, local, current, ctx.signal, ctx);
+              notifyRunResult(ctx, result); return;
+            }
+            if (local && (TERMINAL.has(current.state) || current.state === 'idle')) {
               await manager.clearLocalRun();
-              result = { result, localRun: 'cleared', message: '保存されたPi待機記録だけを削除しました。生成は再送していません。' };
+              ctx.ui.notify('ホスト側の生成は終了していました。保存されたPiの待機記録を削除しました。生成は再送していません。', 'info'); return;
             }
           }
-        }
-        else if (command === 'resume') {
-          const local = await manager.readLocalRun<LocalRun>();
-          const current = await manager.status();
           if (!local && !busy(current)) { result = current; }
           else {
             const saved: LocalRun = local ?? { version: 1, id: current.id ?? '', startedAt: Date.now(), downloaded: {} };
@@ -209,11 +253,9 @@ export default function extension(pi: ExtensionAPI): void {
             if (current.id !== saved.id) throw new Error(`VRAM manager does not have saved run ${saved.id}; it will not be resubmitted`);
             result = await waitForRun(manager, runtime(ctx.cwd).comfy, saved, current, ctx.signal, ctx);
           }
+          notifyRunResult(ctx, result); return;
         }
-        else if (command === 'connect') result = await manager.connect(id ?? ctx.model?.id);
-        else throw new Error('Usage: /comfy status | cancel | recover | resume | connect [MODEL_ID] | setup | reset');
-        ctx.ui.notify(JSON.stringify(result, null, 2), 'info');
-      } catch (error) { ctx.ui.notify(errorMessage(error), 'error'); }
+      } catch (error) { ctx.ui.notify(`${errorMessage(error)}\n操作メニュー: /comfy`, 'error'); }
     },
   });
 
@@ -222,9 +264,9 @@ export default function extension(pi: ExtensionAPI): void {
     const local = await manager.readLocalRun<LocalRun>();
     let state: RunState;
     try { state = await manager.status(); }
-    catch { if (local) { ctx.ui.notify('生成状態を確認できません。/comfy resumeで待機を再開してください。', 'warning'); return { action: 'handled' as const }; } return { action: 'continue' as const }; }
+    catch { if (local) { ctx.ui.notify('生成状態を確認できません。/comfy メニューから待機・復旧を続けてください。', 'warning'); return { action: 'handled' as const }; } return { action: 'continue' as const }; }
     if (local || busy(state)) {
-      ctx.ui.notify('ComfyUI処理が実行中か復旧待ちです。/comfy status、resume、recoverのいずれかを使用してください。', 'warning');
+      ctx.ui.notify('ComfyUI処理が実行中か復旧待ちです。/comfy メニューから状態を確認してください。', 'warning');
       return { action: 'handled' as const };
     }
     return { action: 'continue' as const };
@@ -232,13 +274,52 @@ export default function extension(pi: ExtensionAPI): void {
 
   async function ensureSetupAllowed(ctx: { cwd: string; isIdle(): boolean }, initial: Runtime): Promise<void> {
     if (!ctx.isIdle()) throw new Error('Cannot change the manager URL while Pi is running a turn or tool');
-    if (runtimes.get(ctx.cwd) !== initial) throw new Error('Runtime changed during setup; run /comfy setup again');
+    if (runtimes.get(ctx.cwd) !== initial) throw new Error('接続設定中にランタイムが変わりました。/comfy からやり直してください。');
     const { manager } = initial;
     const local = await manager.readLocalRun<LocalRun>();
-    if (local) throw new Error('A saved run exists; resume or recover it before changing the manager URL');
-    try { if (busy(await manager.status())) throw new Error('Cannot change the manager URL during an active or unresolved run'); }
-    catch (error) { if (error instanceof Error && error.message.includes('Cannot change')) throw error; }
+    if (local) throw new Error('前回の生成記録が残っています。/comfy メニューから待機・復旧を続けてから接続先を変更してください。');
+    let state: RunState | undefined;
+    try { state = await manager.status(); } catch { /* Connection settings must remain available when the manager is unreachable. */ }
+    if (state && busy(state)) throw new Error('実行中または復旧が必要な間は接続先を変更できません。/comfy メニューから処理を解決してください。');
   }
+
+  async function configureManagerUrl(ctx: SetupContext, initial: Runtime, reset: boolean): Promise<void> {
+    await refreshAuth(ctx, ctx.cwd, initial);
+    await ensureSetupAllowed(ctx, initial);
+    const config = loadConfig(ctx.cwd);
+    const defaultUrl = 'http://127.0.0.1:8090';
+    const value = await ctx.ui.input(`VRAM manager URL (Enter: ${reset ? defaultUrl : config.managerUrl})`, reset ? '' : config.managerUrl);
+    if (value === undefined) return;
+    await ensureSetupAllowed(ctx, initial);
+    await saveManagerUrl(ctx.cwd, value.trim() || (reset ? defaultUrl : config.managerUrl));
+    ctx.ui.notify('VRAM manager接続先を保存しました。llama.cppの接続先も変更する場合は /login llama.cpp を実行してください。', 'info');
+  }
+}
+
+function formatComfyStatus(state: RunState | undefined, local: LocalRun | undefined, managerUrl: string, modelId?: string): string {
+  if (!state) return [`ComfyUI / VRAM manager`, `状態: 確認できません${local ? `（保存済み生成 ${local.id} の待機記録あり）` : ''}`, `接続先: ${managerUrl}`, `モデル: ${modelId ?? '未選択'}`, '次の操作: 接続設定からURLを確認してください。'].join('\n');
+  const vram = state.vram ?? state.vramUsed ?? state.vram_used;
+  const vramText = typeof vram === 'number' ? `${Math.round(vram / (vram > 1024 * 1024 ? 1024 * 1024 : 1))} MiB`
+    : vram && typeof vram === 'object' && ('usedMiB' in vram || 'freeMiB' in vram)
+      ? `使用 ${String((vram as Record<string, unknown>).usedMiB ?? '不明')} / 空き ${String((vram as Record<string, unknown>).freeMiB ?? '不明')} / 合計 ${String((vram as Record<string, unknown>).totalMiB ?? '不明')} MiB`
+      : vram === undefined ? '不明' : typeof vram === 'object' ? JSON.stringify(vram) : String(vram);
+  const stateLabel: Record<string, string> = { idle: '待機中', running: '実行中', complete: '完了', failed: '失敗', cancelled: 'キャンセル済み', recovery_required: '復旧が必要' };
+  const phaseLabel: Record<string, string> = { idle: '待機中', queued: '待ち行列', generating: '生成中', starting: '起動中', loading_model: 'モデル読込中', unloading_model: 'モデル解放中', unloading_llm: 'LLM解放中', freeing_comfy: 'ComfyUIメモリ解放中', restoring_llm: 'LLM復元中', recovering: '復旧中', recovery_required: '復旧が必要', complete: '完了', failed: '失敗', cancelled: 'キャンセル済み', waiting_on_host: 'ホスト側の完了待ち' };
+  const action = state.state === 'recovery_required' ? 'ComfyUIを再起動した場合は、起動後に「生成の待機・復旧を続ける」を選んでください。'
+    : busy(state) ? 'メニューから待機を続けるか、必要なら生成をキャンセルできます。'
+      : state.state === 'failed' ? 'エラーを確認し、必要ならComfyUIを復旧してください。'
+        : '生成するには comfy_generate ツールを使えます。';
+  return [`ComfyUI / VRAM manager`, `状態: ${stateLabel[state.state] ?? state.state}`, `段階: ${state.phase ? phaseLabel[state.phase] ?? state.phase : '不明'}`, `管理サーバー: ${managerUrl}`, `モデル: ${modelId ?? '未選択'}`, `VRAM: ${vramText}`, ...(local ? [`Pi待機記録: ${local.id}`] : []), ...(state.error ? [`エラー: ${state.error}`] : []), `次の操作: ${action}`].join('\n');
+}
+
+function notifyRunResult(ctx: { ui: { notify(message: string, level?: string): void } }, value: unknown): void {
+  const wrapper = value as { details?: unknown };
+  const result = (wrapper.details ?? value) as { state?: string; completed?: Array<{ outputs?: Array<{ path?: string; filename?: string }> }>; error?: string };
+  const outputs = result.completed?.flatMap(item => item.outputs ?? []).map(output => output.path ?? output.filename).filter(Boolean) ?? [];
+  const message = result.state === 'complete' ? `生成が完了しました。${outputs.length ? `\n出力:\n${outputs.join('\n')}` : ''}`
+    : result.state === 'recovery_required' ? `生成状態の復旧が必要です。/comfy メニューから再度お試しください。${result.error ? `\nエラー: ${result.error}` : ''}${outputs.length ? `\n取得済み出力:\n${outputs.join('\n')}` : ''}`
+      : `生成状態: ${result.state ?? '不明'}${result.error ? `\nエラー: ${result.error}` : ''}${outputs.length ? `\n出力:\n${outputs.join('\n')}` : ''}`;
+  ctx.ui.notify(message, result.state === 'failed' || result.state === 'recovery_required' ? 'warning' : 'info');
 }
 
 async function waitForRun(
@@ -247,6 +328,35 @@ async function waitForRun(
 ): Promise<ReturnType<typeof text>> {
   try { return await waitForRunImpl(manager, comfy, local, initial, signal, ctx); }
   finally { if (ctx.hasUI) ctx.ui?.setStatus?.('comfy', undefined); }
+}
+
+async function waitForRecovery(
+  manager: ManagerClient, initial: RunState, signal: AbortSignal | undefined,
+  ctx: { hasUI?: boolean; ui?: { setStatus?: (key: string, value: string | undefined) => void } },
+): Promise<RunState> {
+  let state = initial;
+  let retry = manager.config.timeouts.pollMs;
+  const started = Date.now();
+  try {
+    while (state.managerPhase === 'generation') {
+      if (signal?.aborted) return state;
+      updateWaitStatus(ctx, { ...state, phase: 'recovering' }, started);
+      await delay(manager.config.timeouts.pollMs, signal);
+      if (signal?.aborted) return state;
+      try {
+        const current = await manager.status();
+        if (current.id !== state.id) throw new Error(`VRAM manager is tracking a different run (${current.id || 'idle'})`);
+        state = current;
+        retry = manager.config.timeouts.pollMs;
+      } catch (error) {
+        if (signal?.aborted) return state;
+        if (!retryable(error)) throw error;
+        await delay(retry, signal);
+        retry = Math.min(15_000, Math.max(retry * 2, manager.config.timeouts.pollMs));
+      }
+    }
+    return state;
+  } finally { if (ctx.hasUI) ctx.ui?.setStatus?.('comfy', undefined); }
 }
 
 async function waitForRunImpl(
@@ -310,7 +420,7 @@ async function waitForRunImpl(
 
 function interrupted(ctx: { abort(): void; hasUI?: boolean; ui?: { setStatus?: (key: string, value: string | undefined) => void } }, state: RunState): ReturnType<typeof text> {
   ctx.abort();
-  return { ...text({ ...state, state: 'recovery_required', phase: 'waiting_on_host', message: 'Piの待機を中断しました。ホスト生成は継続中です。/comfy resumeで再開できます。' }), terminate: true };
+  return { ...text({ ...state, state: 'recovery_required', phase: 'waiting_on_host', message: 'Piの待機を中断しました。ホスト生成は継続中です。/comfy メニューから再開できます。' }), terminate: true };
 }
 function updateWaitStatus(ctx: { hasUI?: boolean; ui?: { setStatus?: (key: string, text: string | undefined) => void } }, state: RunState, started: number): void {
   if (!ctx.hasUI) return;

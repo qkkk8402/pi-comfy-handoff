@@ -21,6 +21,7 @@ export interface RunnerOptions {
   idempotencyKey?: string;
   onAccepted?: (state: RunState) => Promise<void> | void;
 }
+export interface RunnerStateObservation { id: string; state: RunState['state']; phase: string; model?: string; index?: number; completed: number; error?: string }
 type Snapshot = ModelState[];
 type Journal = RunState & { version: 1; comfyuiUrl: string; llamaServerUrl: string; snapshot: Snapshot; workflows: Workflow[]; index: number; submitUnknown?: boolean; cancelledPromptId?: string };
 const TERMINAL = new Set(['complete', 'failed', 'cancelled']);
@@ -33,7 +34,8 @@ export class Runner {
   private cancellation?: { id: string; promise: Promise<void> };
   private writes: Promise<void> = Promise.resolve();
   private readonly journalPath: string;
-  constructor(private readonly config: HostConfig, private readonly adapters: { llama: LlamaAdapter; comfy: ComfyAdapter; waitForVramRelease?: (minFreeMiB?: number) => Promise<void> }) {
+  private observedSignature = '';
+  constructor(private readonly config: HostConfig, private readonly adapters: { llama: LlamaAdapter; comfy: ComfyAdapter; waitForVramRelease?: (minFreeMiB?: number) => Promise<void>; onState?: (state: RunnerStateObservation) => void }) {
     this.journalPath = join(config.stateDir, 'runner-state.json');
   }
 
@@ -313,6 +315,12 @@ export class Runner {
     });
     this.writes = write.catch(() => undefined);
     await write;
+    const observation: RunnerStateObservation = { id: state.id, state: state.state, phase: state.phase, model: state.model, index: state.index, completed: state.completed.length, error: state.error };
+    const signature = JSON.stringify(observation);
+    if (signature !== this.observedSignature) {
+      this.observedSignature = signature;
+      try { this.adapters.onState?.(observation); } catch { /* observers must not affect generation */ }
+    }
   }
   private publicState(state: Journal): RunState { const { id, phase, state: status, model, promptId, completed, error, updatedAt } = state; return { id, phase, state: status, model, promptId, completed: structuredClone(completed), error, updatedAt }; }
 }

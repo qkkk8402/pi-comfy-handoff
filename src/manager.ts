@@ -8,6 +8,7 @@ import { ComfyClient } from './comfy.js';
 import { loadManagerConfig, parseManagerArgs } from './manager-config.js';
 import { LlamaRouterClient } from './llama.js';
 import { Runner, type RunState } from './runner.js';
+import { errorCode, ManagerLogger, safeEndpoint, type LogSink } from './logger.js';
 import { createVramMonitor, type VramMonitor } from './vram.js';
 import type { ComfyAdapter, LlamaAdapter, ManagerConfig, Workflow } from './types.js';
 
@@ -20,6 +21,7 @@ export interface ManagerDependencies {
   vram?: VramMonitor;
   fetchImpl?: typeof fetch;
   verifyAutoload?: boolean;
+  logSink?: LogSink;
 }
 
 export interface ManagerServer {
@@ -143,6 +145,30 @@ function publicState<T extends RunState | { state: 'idle'; phase: 'idle' }>(stat
 export function createManager(config: ManagerConfig, dependencies: ManagerDependencies = {}): ManagerServer {
   if (!isLoopback(config.listenHost) && !config.token) throw new Error('A bearer token is required when the manager listens on a non-loopback address');
   const fetchImpl = dependencies.fetchImpl ?? fetch;
+  const logger = new ManagerLogger(config.logLevel ?? 'info', dependencies.logSink);
+  const timers = new Set<NodeJS.Timeout>();
+  const redactClientError = (error: unknown): string => {
+    let detail = error instanceof Error ? error.message : String(error);
+    for (const secret of [config.token, config.comfyApiKey, config.llamaApiKey]) {
+      if (secret) detail = detail.split(secret).join('[redacted]');
+    }
+    return detail.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]').replace(/[\r\n\t]+/g, ' ').slice(0, 1000);
+  };
+  const safeError = (error: unknown): string => {
+    const shaped = error as { name?: unknown; status?: unknown; messages?: unknown; body?: unknown } | null;
+    if (shaped && (shaped.name === 'ComfyJobError' || shaped.name === 'ComfyHttpError')) {
+      return shaped.name === 'ComfyJobError' ? 'ComfyUI generation failed' : `ComfyUI returned HTTP ${typeof shaped.status === 'number' ? shaped.status : 'error'}`;
+    }
+    if (shaped && shaped.name === 'LlamaRouterError' && typeof shaped.status === 'number') return `llama-server returned HTTP ${shaped.status}`;
+    let detail = error instanceof Error ? error.message : String(error);
+    const comfyHttp = detail.match(/ComfyUI (\/\S+) returned HTTP (\d+):/i);
+    if (comfyHttp) return `ComfyUI ${comfyHttp[1]} returned HTTP ${comfyHttp[2]}`;
+    const llamaHttp = detail.match(/(GET|POST|PUT|DELETE) (\/\S+) failed \((\d+)\):/i);
+    if (llamaHttp) return `llama-server ${llamaHttp[1]} ${llamaHttp[2]} returned HTTP ${llamaHttp[3]}`;
+    if (/ComfyUI job .* failed:/i.test(detail)) return 'ComfyUI generation failed';
+    detail = detail.replace(/Upstream returned HTTP (\d+):[\s\S]*/i, 'Upstream returned HTTP $1');
+    return redactClientError(detail).slice(0, 240) || errorCode(error);
+  };
   const comfy = dependencies.comfy ?? new ComfyClient(config.comfyuiUrl, {
     requestMs: config.timeouts.requestMs, generationMs: config.timeouts.generationMs,
     pollMs: config.timeouts.pollMs, settleMs: config.timeouts.settleMs,
@@ -154,11 +180,29 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
   }) as LlamaRouterClient & LlamaAdapter;
   let vram = dependencies.vram;
   const waitForVramRelease = async (minFreeMiB?: number): Promise<void> => {
-    const sample = await vram?.read();
-    if (sample) { await vram!.waitForRelease(minFreeMiB); return; }
-    await comfy.waitForRelease?.(minFreeMiB);
+    logger.log('info', `VRAM release wait begin${minFreeMiB === undefined ? '' : ` minFreeMiB=${minFreeMiB}`}`);
+    let sampling = false;
+    const sampleTimer = setInterval(() => {
+      if (sampling || !vram || config.logLevel !== 'debug') return;
+      sampling = true;
+      void vram.read().then(value => logger.log('debug', `VRAM release wait sample ${JSON.stringify(value)}`)).catch(() => undefined).finally(() => { sampling = false; });
+    }, 5_000);
+    timers.add(sampleTimer);
+    sampleTimer.unref();
+    try {
+      const sample = await vram?.read();
+      if (sample) { logger.log('debug', `VRAM before release ${JSON.stringify(sample)}`); await vram!.waitForRelease(minFreeMiB); }
+      else await comfy.waitForRelease?.(minFreeMiB);
+      const after = await vram?.read().catch(() => undefined);
+      if (after) logger.log('debug', `VRAM after release ${JSON.stringify(after)}`);
+      logger.log('info', 'VRAM release wait end');
+    } catch (error) { logger.log('error', `VRAM release wait failed: ${safeError(error)}`); throw error; }
+    finally { clearInterval(sampleTimer); timers.delete(sampleTimer); }
   };
-  const runner = new Runner(config, { comfy, llama, waitForVramRelease });
+  const runner = new Runner(config, { comfy, llama, waitForVramRelease, onState: state => {
+    const detail = state.error ? ` error=${safeError(state.error)}` : '';
+    logger.log(state.error ? 'error' : 'info', `run=${state.id} state=${state.state} phase=${state.phase} model=${state.model ?? 'unknown'} completed=${state.completed}${state.index === undefined ? '' : ` workflow=${state.index + 1}`}${detail}`);
+  } });
   let acceptingInference = true;
   let inFlight = 0;
   let transition: 'generation' | 'model' | undefined;
@@ -182,8 +226,10 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
   };
   const updateGate = async (state?: RunState): Promise<void> => {
     const current = state ?? await runner.status();
+    const wasAccepting = acceptingInference;
     acceptingInference = ['complete', 'failed', 'cancelled', 'idle'].includes(current.state);
     transition = undefined;
+    if (wasAccepting !== acceptingInference) logger.log('info', `inference ${acceptingInference ? 'resumed' : 'paused'} run=${'id' in current ? current.id : 'none'} state=${current.state}`);
   };
   const forward = async (req: IncomingMessage, res: ServerResponse, base: string, path: string, keepReading = false): Promise<void> => {
     const headers = new Headers();
@@ -229,6 +275,7 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
     if (transition || runner.isBusy) { sendError(res, 409, `Cannot ${operation} llama.cpp model${typeof name === 'string' ? ` "${name}"` : ''}: a GPU operation is already active`); return; }
     if (typeof name !== 'string' || !name.trim()) { sendError(res, 400, 'model is required'); return; }
     transition = 'model'; acceptingInference = false;
+    logger.log('info', `model ${operation} begin; inference paused`);
     try {
       const runState = await runner.status();
       if (runState.state === 'running' || runState.state === 'recovery_required') throw new Error('Recover the active generation before changing models');
@@ -247,10 +294,12 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
         await llama.load(name);
       } else await llama.unload(name);
       acceptingInference = true; transition = undefined;
+      logger.log('info', `model ${operation} complete; inference resumed`);
       sendJson(res, 200, { success: true, model: name, status: operation === 'load' ? 'loaded' : 'unloaded' });
     } catch (error) {
       acceptingInference = false; transition = undefined;
-      sendError(res, 409, `Cannot ${operation} llama.cpp model "${name}": ${error instanceof Error ? error.message : String(error)}`);
+      logger.log('error', `model ${operation} failed: ${safeError(error)}`);
+      sendError(res, 409, `Cannot ${operation} llama.cpp model: ${redactClientError(error)}`);
     }
   };
 
@@ -276,6 +325,7 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
         }
         if (transition || runner.isBusy) { sendError(res, 409, 'A GPU operation is already active'); return; }
         transition = 'generation'; acceptingInference = false;
+        logger.log('info', `inference paused run=${body.id}`);
         let accept!: (state: RunState) => void;
         let reject!: (error: unknown) => void;
         let acceptedOnce = false;
@@ -285,13 +335,41 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
         if (current.state === 'running' || current.state === 'recovery_required') {
           transition = undefined; sendError(res, 409, 'An unfinished job must be recovered first'); return;
         }
+        let lastProgressLog = 0;
         const task = runner.generate(workflows, {
           idempotencyKey: body.id,
           modelId: typeof body.modelId === 'string' ? body.modelId : undefined,
-          onAccepted: async state => { acceptOnce(state); await waitForInference(); },
+          onProgress: value => {
+            const now = Date.now();
+            if (now - lastProgressLog < 1_000) return;
+            lastProgressLog = now;
+            if (config.logLevel === 'debug') {
+              const data = record(value) ? value : {};
+              const numeric = ['value', 'max', 'progress', 'percentage', 'elapsedMs'].flatMap(key => typeof data[key] === 'number' ? [`${key}=${data[key]}`] : []);
+              const state = ['running', 'executing', 'success', 'complete', 'failed'].includes(String(data.state)) ? `state=${data.state}` : '';
+              logger.log('debug', `generation progress run=${body.id}${state ? ` ${state}` : ''}${numeric.length ? ` ${numeric.join(' ')}` : ''}`);
+            }
+          },
+          onAccepted: async state => {
+            logger.log('info', `generation accepted run=${state.id} workflows=${workflows.length} model=${state.model ?? 'default'}`);
+            acceptOnce(state);
+            await waitForInference();
+          },
         });
         job = { id: body.id, modelId: typeof body.modelId === 'string' ? body.modelId : undefined, workflows: structuredClone(workflows), accepted, task };
+        const startedAt = Date.now();
+        const heartbeat = setInterval(() => {
+          void (async () => {
+            const sample = await vram?.read().catch(() => undefined);
+            const mem = record(sample) ? Object.entries(sample).filter(([key, value]) => /free|used|total/i.test(key) && typeof value === 'number').map(([key, value]) => `${key}=${value}`).join(' ') : '';
+            logger.log('info', `generation heartbeat run=${body.id} elapsed=${Math.floor((Date.now() - startedAt) / 1000)}s${mem ? ` ${mem}` : ''}`);
+          })().catch(() => undefined);
+        }, 30_000);
+        heartbeat.unref();
+        timers.add(heartbeat);
+        void task.finally(() => { clearInterval(heartbeat); timers.delete(heartbeat); }).catch(() => undefined);
         void task.then(async state => { acceptOnce(state); await updateGate(state); }).catch(async error => {
+          logger.log('error', `generation failed run=${body.id}: ${safeError(error)}`);
           if (!acceptedOnce && job?.id === body.id) job = undefined;
           const state = await runner.status().catch(() => undefined);
           await updateGate(state as RunState | undefined).catch(() => { acceptingInference = false; });
@@ -306,7 +384,12 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
         const body = await readJson(req);
         const current = await runner.status();
         if (record(body) && typeof body.id === 'string' && current.state !== 'idle' && body.id !== current.id) { sendError(res, 409, 'Unknown job ID'); return; }
-        void runner.cancel().catch(() => undefined);
+        logger.log('info', 'cancellation requested');
+        void runner.cancel().then(async () => {
+          // A standalone cancellation can finish recovery and restore the LLM.
+          // Active generation owns its gate transition and will update it in its task handler.
+          if (!runner.isBusy) await updateGate();
+        }).catch(error => logger.log('error', `cancellation failed: ${safeError(error)}`));
         sendJson(res, 202, await stateWithMetrics()); return;
       }
       if (path === '/recover' && req.method === 'POST') {
@@ -315,8 +398,9 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
         if (record(body) && typeof body.id === 'string' && current.state !== 'idle' && body.id !== current.id) { sendError(res, 409, 'Unknown job ID'); return; }
         if (transition || runner.isBusy) { sendError(res, 409, 'A GPU operation is already active'); return; }
         transition = 'generation'; acceptingInference = false;
+        logger.log('info', `recovery begin run=${current.state === 'idle' ? 'none' : current.id}`);
         const task = runner.recover();
-        void task.then(async state => updateGate(state)).catch(() => { acceptingInference = false; transition = undefined; });
+        void task.then(async state => { logger.log('info', `recovery complete run=${state.id} state=${state.state}`); await updateGate(state); }).catch(error => { logger.log('error', `recovery failed: ${safeError(error)}`); acceptingInference = false; transition = undefined; });
         sendJson(res, 202, await stateWithMetrics()); return;
       }
       if (path === '/connect' && req.method === 'POST') {
@@ -324,6 +408,7 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
         if (!record(body)) { sendError(res, 400, 'Expected { modelId? }'); return; }
         if (transition || runner.isBusy) { sendError(res, 409, 'A GPU operation is already active'); return; }
         transition = 'model'; acceptingInference = false;
+        logger.log('info', 'model connect begin; inference paused');
         const task = (async () => {
           const runState = await runner.status();
           if (runState.state === 'running' || runState.state === 'recovery_required') throw new Error('Recover the active generation before connecting a model');
@@ -339,7 +424,7 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
           }
           await runner.connect(modelId);
         })();
-        void task.then(() => { acceptingInference = true; transition = undefined; }).catch(() => { acceptingInference = false; transition = undefined; });
+        void task.then(() => { logger.log('info', 'model connect complete'); acceptingInference = true; transition = undefined; }).catch(error => { logger.log('error', `model connect failed: ${safeError(error)}`); acceptingInference = false; transition = undefined; });
         await task;
         sendJson(res, 200, { ready: true }); return;
       }
@@ -365,14 +450,22 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
       sendError(res, 404, 'Unknown manager endpoint');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      sendError(res, error instanceof HttpError ? error.status : message.includes('10 MiB') ? 413 : 502, message);
+      logger.log('error', `request failed: ${safeError(error)}`);
+      sendError(res, error instanceof HttpError ? error.status : message.includes('10 MiB') ? 413 : 502, redactClientError(error));
     }
   };
 
-  const server = createServer((req, res) => { void handler(req, res); });
+  const server = createServer((req, res) => {
+    const startedAt = Date.now();
+    const requestedPath = (req.url ?? '/').split('?')[0]!;
+    const safePaths = new Set(['/health', '/status', '/generate', '/cancel', '/recover', '/connect', '/llama/v1/chat/completions', '/llama/v1/completions', '/llama/completion', '/llama/models', '/llama/models/sse', '/llama/v1/models', '/llama/props', '/llama/health', '/llama/models/load', '/llama/models/unload', '/comfy/object_info', '/comfy/view', '/comfy/upload/image']);
+    const path = safePaths.has(requestedPath) ? requestedPath : '<unknown>';
+    void handler(req, res).finally(() => logger.log('debug', `http ${req.method ?? 'GET'} ${path} status=${res.statusCode} duration=${Date.now() - startedAt}ms`));
+  });
   return {
     server,
     async start() {
+      logger.log('info', `manager starting listen=${config.listenHost}:${config.listenPort} llama=${safeEndpoint(config.llamaServerUrl)} comfyui=${safeEndpoint(config.comfyuiUrl)}`);
       if (!vram) vram = await createVramMonitor({ gpu: config.gpu, pollMs: config.timeouts.pollMs, settleMs: config.timeouts.settleMs });
       const response = await fetchImpl(`${config.llamaServerUrl}/props`, {
         headers: config.llamaApiKey ? { authorization: `Bearer ${config.llamaApiKey}` } : undefined,
@@ -391,8 +484,13 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
       ready = true;
       server.listen(config.listenPort, config.listenHost);
       await once(server, 'listening');
+      const boundAddress = server.address();
+      logger.log('info', `manager ready listen=${config.listenHost}:${boundAddress && typeof boundAddress !== 'string' ? boundAddress.port : config.listenPort}`);
     },
     async close() {
+      logger.log('info', 'manager shutting down');
+      for (const timer of timers) clearInterval(timer);
+      timers.clear();
       ready = false;
       server.closeAllConnections();
       if (server.listening) await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
@@ -403,13 +501,12 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
 async function run(): Promise<void> {
   const options = parseManagerArgs(process.argv.slice(2));
   if (options.help) {
-    process.stdout.write(`Usage: pi-comfy-manager [--config FILE] [options]\n\nOptions:\n  --host HOST              Listen address (default 127.0.0.1)\n  --port PORT              Listen port (default 8090)\n  --llama-url URL           llama-server URL (default http://127.0.0.1:8080)\n  --comfy-url URL           ComfyUI URL (default http://127.0.0.1:8188)\n  --state-dir DIR           State directory (default ./.pi-comfy-manager)\n  --gpu SELECTOR            GPU selector for VRAM monitoring\n  --min-free-mib MIB        Required free VRAM in MiB\n  --request-ms MS           HTTP request timeout\n  --model-ms MS              Model operation timeout\n  --settle-ms MS             VRAM settle timeout\n  --poll-ms MS               VRAM polling interval\n  --generation-ms MS         Generation timeout (0 means unlimited)\n  -h, --help                 Show this help\n\nCLI values override JSON values; JSON values override defaults.\nTokens and API keys are read from environment variables.\n`); return;
+    process.stdout.write(`Usage: pi-comfy-manager [--config FILE] [options]\n\nOptions:\n  --host HOST              Listen address (default 127.0.0.1)\n  --port PORT              Listen port (default 8090)\n  --llama-url URL           llama-server URL (default http://127.0.0.1:8080)\n  --comfy-url URL           ComfyUI URL (default http://127.0.0.1:8188)\n  --state-dir DIR           State directory (default ./.pi-comfy-manager)\n  --gpu SELECTOR            GPU selector for VRAM monitoring\n  --min-free-mib MIB        Required free VRAM in MiB\n  --request-ms MS           HTTP request timeout\n  --model-ms MS              Model operation timeout\n  --settle-ms MS             VRAM settle timeout\n  --poll-ms MS               VRAM polling interval\n  --generation-ms MS         Generation timeout (0 means unlimited)\n  --log-level LEVEL          Log level: silent, error, info, debug (default info)\n  -h, --help                 Show this help\n\nCLI values override JSON values; JSON values override defaults.\nTokens and API keys are read from environment variables.\n`); return;
   }
   const config = loadManagerConfig(options.configFile, process.cwd(), options.overrides);
   const vram = await createVramMonitor({ gpu: config.gpu, pollMs: config.timeouts.pollMs, settleMs: config.timeouts.settleMs });
   const manager = createManager(config, { vram });
   await manager.start();
-  process.stdout.write(`VRAM manager listening on ${config.listenHost}:${config.listenPort}\n`);
   const stop = () => { void manager.close().finally(() => process.exit(0)); };
   process.once('SIGINT', stop); process.once('SIGTERM', stop);
 }
