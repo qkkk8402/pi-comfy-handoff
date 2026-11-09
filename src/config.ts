@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 
 export interface ClientConfig {
+  enabled: boolean;
   managerUrl: string;
   outputDir: string;
   stateDir: string;
@@ -53,7 +54,10 @@ export function parseConfig(raw: Record<string, unknown>, cwd = process.cwd(), e
   if (timeouts !== undefined && (!timeouts || typeof timeouts !== 'object' || Array.isArray(timeouts))) throw new Error('timeouts must be an object');
   const values = (timeouts ?? {}) as Record<string, unknown>;
   const apiKeyEnv = optionalString(raw.apiKeyEnv, 'apiKeyEnv') ?? 'COMFY_MANAGER_TOKEN';
+  const enabled = raw.enabled === undefined ? true : raw.enabled;
+  if (typeof enabled !== 'boolean') throw new Error('enabled must be a boolean');
   return {
+    enabled,
     managerUrl: apiUrl(raw.managerUrl ?? 'http://127.0.0.1:8090', 'managerUrl'),
     outputDir: resolve(cwd, optionalString(raw.outputDir, 'outputDir') ?? 'outputs/comfy'),
     stateDir: resolve(cwd, optionalString(raw.stateDir, 'stateDir') ?? '.pi/comfy-state'),
@@ -76,9 +80,8 @@ export function loadConfig(cwd = process.cwd(), file = resolve(cwd, '.pi/comfyui
   return parseConfig(raw as Record<string, unknown>, cwd);
 }
 
-export async function saveManagerUrl(cwd: string, managerUrl: unknown): Promise<void> {
+async function updateConfig(cwd: string, update: Record<string, unknown>): Promise<void> {
   const file = resolve(cwd, '.pi/comfyui.json');
-  const manager = apiUrl(managerUrl, 'Manager URL');
   let raw: Record<string, unknown> = {};
   try {
     const value: unknown = JSON.parse(readFileSync(file, 'utf8'));
@@ -87,9 +90,18 @@ export async function saveManagerUrl(cwd: string, managerUrl: unknown): Promise<
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
-  const data = `${JSON.stringify({ ...raw, managerUrl: manager }, null, 2)}\n`;
+  const data = `${JSON.stringify({ ...raw, ...update }, null, 2)}\n`;
   await mkdir(resolve(cwd, '.pi'), { recursive: true });
   const temporary = `${file}.${randomUUID()}.tmp`;
   await writeFile(temporary, data, { flag: 'wx', mode: 0o600 });
   await rename(temporary, file);
+}
+
+export async function saveManagerUrl(cwd: string, managerUrl: unknown): Promise<void> {
+  await updateConfig(cwd, { managerUrl: apiUrl(managerUrl, 'Manager URL') });
+}
+
+export async function saveEnabled(cwd: string, enabled: boolean): Promise<void> {
+  if (typeof enabled !== 'boolean') throw new Error('enabled must be a boolean');
+  await updateConfig(cwd, { enabled });
 }

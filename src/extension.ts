@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { createHash } from 'node:crypto';
-import { loadConfig, matchingLlamaUrl, saveManagerUrl } from './config.js';
+import { loadConfig, matchingLlamaUrl, saveEnabled, saveManagerUrl } from './config.js';
 import { ComfyClient } from './comfy.js';
 import { ManagerClient, ManagerHttpError, type RunState } from './manager-client.js';
 import { projectFile, readProjectJson, writeProjectJson } from './files.js';
@@ -10,6 +10,7 @@ import type { Workflow } from './types.js';
 
 const text = (value: unknown): { content: [{ type: 'text'; text: string }]; details: unknown; terminate?: boolean } => ({ content: [{ type: 'text' as const, text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }], details: value });
 const TERMINAL = new Set(['complete', 'failed', 'cancelled']);
+const COMFY_TOOLS = ['comfy_upload', 'comfy_inspect', 'comfy_workflow', 'comfy_validate', 'comfy_generate'] as const;
 interface LocalRun { version: 1; id: string; startedAt: number; downloaded: Record<string, string> }
 interface Runtime { manager: ManagerClient; comfy: ComfyClient }
 interface SetupContext extends AuthContext { cwd: string; isIdle(): boolean; ui: { input(prompt: string, value: string): Promise<string | undefined>; notify(message: string, level?: string): void } }
@@ -17,6 +18,23 @@ type AuthContext = { modelRegistry?: { getProviderAuth?: (provider: string) => P
 
 export default function extension(pi: ExtensionAPI): void {
   const runtimes = new Map<string, Runtime>();
+  const syncDisabledTools = (cwd: string) => {
+    if (loadConfig(cwd).enabled) return;
+    const comfy = new Set<string>(COMFY_TOOLS);
+    pi.setActiveTools(pi.getActiveTools().filter(name => !comfy.has(name)));
+  };
+  const setToolsEnabled = (enabled: boolean) => {
+    const current = pi.getActiveTools();
+    const comfy = new Set<string>(COMFY_TOOLS);
+    pi.setActiveTools(enabled
+      ? [...current, ...COMFY_TOOLS.filter(name => !current.includes(name))]
+      : current.filter(name => !comfy.has(name)));
+  };
+  const requireEnabled = (cwd: string) => {
+    if (!loadConfig(cwd).enabled) throw new Error('ComfyUI tools are disabled. Use /comfy to enable them.');
+  };
+  pi.on('session_start', (_event, ctx) => { syncDisabledTools(ctx.cwd); });
+  pi.on('before_agent_start', (_event, ctx) => { syncDisabledTools(ctx.cwd); });
   const runtime = (cwd: string) => {
     let value = runtimes.get(cwd);
     if (!value) {
@@ -54,6 +72,7 @@ export default function extension(pi: ExtensionAPI): void {
     description: 'Upload a project-local input file through the VRAM manager. Use the returned name and subfolder in workflow inputs.',
     parameters: Type.Object({ path: Type.String() }),
     async execute(_id, args, _signal, _update, ctx) {
+      requireEnabled(ctx.cwd);
       const client = await refreshAuth(ctx, ctx.cwd);
       return text(await client.comfy.uploadInput(await projectFile(ctx.cwd, args.path)));
     },
@@ -63,6 +82,7 @@ export default function extension(pi: ExtensionAPI): void {
     description: 'List available ComfyUI node classes, or inspect one class and its inputs/model choices.',
     parameters: Type.Object({ nodeClass: Type.Optional(Type.String()) }),
     async execute(_id, args, _signal, _update, ctx) {
+      requireEnabled(ctx.cwd);
       const info = await (await refreshAuth(ctx, ctx.cwd)).comfy.objectInfo();
       if (args.nodeClass) {
         if (!Object.hasOwn(info, args.nodeClass)) throw new Error(`Unknown node class: ${args.nodeClass}`);
@@ -79,6 +99,7 @@ export default function extension(pi: ExtensionAPI): void {
       path: Type.String(), workflow: Type.Optional(Type.Unknown()), patches: Type.Optional(Type.Array(Type.Unknown())),
     }),
     async execute(_id, args, _signal, _update, ctx) {
+      requireEnabled(ctx.cwd);
       if (args.action === 'inspect') return text(summarizeApiWorkflow(await readProjectJson(ctx.cwd, args.path)));
       let workflow: unknown = args.workflow;
       if (args.action === 'patch') {
@@ -96,6 +117,7 @@ export default function extension(pi: ExtensionAPI): void {
     description: 'Validate an API-format workflow against live ComfyUI node definitions and model choices.',
     parameters: Type.Object({ path: Type.String() }),
     async execute(_id, args, _signal, _update, ctx) {
+      requireEnabled(ctx.cwd);
       return text(validateApiWorkflow(await readProjectJson(ctx.cwd, args.path), await (await refreshAuth(ctx, ctx.cwd)).comfy.objectInfo()));
     },
   });
@@ -105,6 +127,7 @@ export default function extension(pi: ExtensionAPI): void {
     promptGuidelines: ['Inspect node definitions and validate the workflow first.', 'Use exact installed model filenames and prepare inputs before generation.', 'Do not call ComfyUI or llama-server endpoints directly.'],
     parameters: Type.Object({ path: Type.Optional(Type.String()), paths: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: 32 })) }),
     async execute(toolCallId, args, signal, onUpdate, ctx) {
+      requireEnabled(ctx.cwd);
       const { manager, comfy } = await refreshAuth(ctx, ctx.cwd);
       if (Boolean(args.path) === Boolean(args.paths)) throw new Error('Specify exactly one of path or paths');
       const local = await manager.readLocalRun<LocalRun>();
@@ -162,21 +185,34 @@ export default function extension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand('comfy', {
-    description: 'ComfyUIの状態確認、待機・復旧、接続設定',
+    description: 'ComfyUIツールの有効・無効切替、状態確認、待機・復旧、接続設定',
     async handler(args, ctx) {
       try {
         const command = args.trim();
+        const initialConfig = loadConfig(ctx.cwd);
+        if (!initialConfig.enabled) {
+          const status = 'ComfyUIツール: 無効';
+          if (command === 'status' || !ctx.hasUI) { ctx.ui.notify(status, 'info'); return; }
+          if (command) throw new Error('使い方: /comfy（操作メニュー）または /comfy status');
+          const choice = await ctx.ui.select(status, ['ComfyUIツールを有効にする', '閉じる']);
+          if (choice !== 'ComfyUIツールを有効にする') return;
+          if (!ctx.isIdle()) throw new Error('Piが実行中のため切り替えできません。アイドル状態で再度お試しください。');
+          await saveEnabled(ctx.cwd, true);
+          setToolsEnabled(true);
+          ctx.ui.notify('ComfyUIツールを有効にしました。次の推論リクエストから利用できます。', 'info');
+          return;
+        }
         if (command === 'status') {
           const { manager } = await refreshAuth(ctx, ctx.cwd);
           const state = await manager.status();
           const local = await manager.readLocalRun<LocalRun>();
-          ctx.ui.notify(formatComfyStatus(state, local, manager.baseUrl, ctx.model?.id), 'info');
+          ctx.ui.notify(`ComfyUIツール: 有効\n${formatComfyStatus(state, local, manager.baseUrl, ctx.model?.id)}`, 'info');
           return;
         }
         if (command && command !== 'status') throw new Error('使い方: /comfy（操作メニュー）または /comfy status');
         if (!ctx.hasUI) {
           const { manager } = await refreshAuth(ctx, ctx.cwd);
-          ctx.ui.notify(formatComfyStatus(await manager.status(), await manager.readLocalRun<LocalRun>(), manager.baseUrl, ctx.model?.id), 'info');
+          ctx.ui.notify(`ComfyUIツール: 有効\n${formatComfyStatus(await manager.status(), await manager.readLocalRun<LocalRun>(), manager.baseUrl, ctx.model?.id)}`, 'info');
           return;
         }
 
@@ -186,7 +222,7 @@ export default function extension(pi: ExtensionAPI): void {
         let state: RunState | undefined;
         let statusError: string | undefined;
         try { state = await manager.status(); } catch (error) { statusError = errorMessage(error); }
-        const lines = [formatComfyStatus(state, localAtOpen, manager.baseUrl, ctx.model?.id)];
+        const lines = ['ComfyUIツール: 有効', formatComfyStatus(state, localAtOpen, manager.baseUrl, ctx.model?.id)];
         if (statusError) lines.push(`接続エラー: ${statusError}`);
         const unresolved = Boolean(localAtOpen) || (state && (busy(state) || state.state === 'recovery_required'));
         const choices = [
@@ -194,10 +230,17 @@ export default function extension(pi: ExtensionAPI): void {
           ...(unresolved ? ['生成の待機・復旧を続ける'] : []),
           ...(state && busy(state) ? ['生成をキャンセル'] : []),
           ...(!unresolved ? ['LLMを接続（現在のモデル）'] : []),
-          '接続設定', '閉じる',
+          '接続設定', 'ComfyUIツールを無効にする', '閉じる',
         ];
         const choice = await ctx.ui.select(lines.join('\n'), choices);
         if (!choice || choice === '閉じる') return;
+        if (choice === 'ComfyUIツールを無効にする') {
+          if (!ctx.isIdle()) throw new Error('Piが実行中のため切り替えできません。アイドル状態で再度お試しください。');
+          await saveEnabled(ctx.cwd, false);
+          setToolsEnabled(false);
+          ctx.ui.notify('ComfyUIツールを無効にしました。次の推論リクエストから反映されます。実行中のホスト生成は継続します。', 'info');
+          return;
+        }
         if (choice === '状態を表示') {
           ctx.ui.notify(lines.join('\n'), statusError ? 'warning' : 'info'); return;
         }
@@ -260,6 +303,7 @@ export default function extension(pi: ExtensionAPI): void {
   });
 
   pi.on('input', async (_event, ctx) => {
+    if (!loadConfig(ctx.cwd).enabled) return { action: 'continue' as const };
     const manager = (await refreshAuth(ctx, ctx.cwd)).manager;
     const local = await manager.readLocalRun<LocalRun>();
     let state: RunState;
