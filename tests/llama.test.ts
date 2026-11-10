@@ -38,6 +38,7 @@ test('unload waits until the model is actually unloaded', async () => {
 
 test('load does not treat loading or sleeping as ready', async () => {
   const router = fakeRouter([{ name: 'agent-model', status: 'unloaded' }]);
+  const diagnostics: string[] = [];
   let reads = 0;
   const baseFetch = router.fetchImpl;
   router.fetchImpl = async (input, init) => {
@@ -51,10 +52,14 @@ test('load does not treat loading or sleeping as ready', async () => {
     fetchImpl: router.fetchImpl,
     pollMs: 1,
     modelMs: 100,
+    onDiagnostic: message => diagnostics.push(message),
   });
   await client.load('agent-model');
   assert.equal(router.models[0]!.status, 'loaded');
   assert.ok(reads >= 3);
+  assert.ok(diagnostics.some(message => message.includes('state=loading')));
+  assert.ok(diagnostics.some(message => message.includes('state=loaded')));
+  assert.ok(diagnostics.some(message => message.includes('POST /models/load status=200')));
 });
 
 test('load wakes a sleeping model but waits for loaded state', async () => {
@@ -77,6 +82,25 @@ test('load wakes a sleeping model but waits for loaded state', async () => {
   assert.equal(router.models[0]!.status, 'loaded');
   assert.ok(router.calls.some((call) => call.path === '/models/unload'));
   assert.ok(router.calls.some((call) => call.path === '/models/load'));
+});
+
+test('load stops polling promptly when the router marks the model failed', async () => {
+  let reads = 0;
+  const client = new LlamaRouterClient('http://127.0.0.1:8080', {
+    modelMs: 60_000,
+    pollMs: 5_000,
+    fetchImpl: async input => {
+      const path = new URL(String(input)).pathname;
+      if (path === '/models/load') return Response.json({ success: true });
+      if (path === '/models') {
+        reads++;
+        return Response.json({ models: [{ id: 'agent-model', status: { value: 'loading', failed: true, exit_code: 17 } }] });
+      }
+      return new Response('{}', { status: 404 });
+    },
+  });
+  await assert.rejects(client.load('agent-model'), /failed while waiting.*exit code 17/);
+  assert.equal(reads, 2, 'initial catalog plus one failed-state poll; do not wait for modelMs');
 });
 
 test('unloading an absent model is already complete', async () => {

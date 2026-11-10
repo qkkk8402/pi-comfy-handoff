@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import { once } from 'node:events';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { createManager } from '../src/manager.js';
 import { parseManagerConfig } from '../src/manager-config.js';
@@ -154,18 +154,169 @@ test('model operation errors retain diagnostics while redacting configured crede
   try {
     await manager.start();
     const address = manager.server.address(); assert.ok(address && typeof address !== 'string');
-    for (const [path, body, status] of [['/llama/models/load', { model: 'fixture-model' }, 409], ['/connect', { modelId: 'fixture-model' }, 502]] as const) {
-      const response: Response = await fetch(`http://127.0.0.1:${address.port}${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
-      assert.equal(response.status, status);
-      const message = (await response.json() as any).error.message as string;
-      assert.match(message, /load failed with credential \[redacted\]/);
-      assert.ok(!message.includes(secret));
+    const load = await fetch(`http://127.0.0.1:${address.port}/llama/models/load`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'fixture-model' }) });
+    assert.equal(load.status, 202);
+    let failed: any;
+    for (let i = 0; i < 100; i++) {
+      failed = await (await fetch(`http://127.0.0.1:${address.port}/status`)).json() as any;
+      if (failed.modelOperation?.state === 'failed') break;
+      await new Promise(resolve => setTimeout(resolve, 5));
     }
+    assert.match(failed.modelOperation.error, /load failed with credential \[redacted\]/);
+    assert.ok(!failed.modelOperation.error.includes(secret));
+    const catalog = await (await fetch(`http://127.0.0.1:${address.port}/llama/models`)).json() as any;
+    assert.equal(catalog.data[0].status.value, 'unloaded');
+    assert.equal(catalog.data[0].status.failed, true);
+    assert.match(catalog.data[0].manager_error, /load failed with credential \[redacted\]/);
+    const connect = await fetch(`http://127.0.0.1:${address.port}/connect`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modelId: 'fixture-model' }) });
+    assert.equal(connect.status, 502);
   } finally {
     await manager.close();
     await close(upstream);
     await rm(cwd, { recursive: true, force: true });
   }
+});
+
+test('a model preflight failure is terminal in the catalog and a retry clears it', async () => {
+  await mkdir('work', { recursive: true });
+  const cwd = await mkdtemp(join(process.cwd(), 'work', 'manager-model-retry-'));
+  let queueBusy = true; let model = 'unloaded';
+  const upstream = createServer((req, res) => {
+    const path = new URL(req.url ?? '/', 'http://upstream').pathname;
+    res.setHeader('content-type', 'application/json');
+    if (path === '/props') { res.end('{"models_autoload":false}'); return; }
+    if (path === '/models') { res.end(JSON.stringify({ data: [{ id: 'fixture-model', status: { value: model, ...(model === 'unloaded' ? { failed: true, exit_code: 17 } : {}) } }] })); return; }
+    if (path === '/models/load') { model = 'loaded'; res.end('{"success":true}'); return; }
+    res.statusCode = 404; res.end('{}');
+  });
+  const llamaUrl = await listen(upstream);
+  const manager = createManager({ ...parseManagerConfig({ comfyuiUrl: 'http://127.0.0.1:8188', llamaServerUrl: llamaUrl, stateDir: cwd, timeouts: { requestMs: 2_000, modelMs: 2_000, generationMs: 0, settleMs: 100, pollMs: 5 } }), listenPort: 0 }, {
+    comfy: { async queue() { return { running: queueBusy ? [{ promptId: 'busy' }] : [], pending: [] }; }, async free() {} } as any,
+    vram: { async read() { return { source: 'amdgpu' as const, device: 'card1', totalMiB: 1000, usedMiB: 100, freeMiB: 900 }; }, async waitForRelease() { return { source: 'amdgpu' as const, device: 'card1', totalMiB: 1000, usedMiB: 100, freeMiB: 900 }; } },
+  });
+  try {
+    await manager.start();
+    const address = manager.server.address(); assert.ok(address && typeof address !== 'string');
+    const base = `http://127.0.0.1:${address.port}`;
+    const startLoad = () => fetch(`${base}/llama/models/load`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'fixture-model' }) });
+    assert.equal((await startLoad()).status, 202);
+    let failed: any;
+    for (let i = 0; i < 100; i++) {
+      failed = await (await fetch(`${base}/status`)).json() as any;
+      if (failed.modelOperation?.state === 'failed') break;
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.match(failed.modelOperation.error, /ComfyUI queue is not empty/);
+    const failedCatalog = await (await fetch(`${base}/llama/models`)).json() as any;
+    assert.equal(failedCatalog.data[0].status.value, 'unloaded');
+    assert.equal(failedCatalog.data[0].status.failed, true);
+    assert.equal('exit_code' in failedCatalog.data[0].status, false);
+    queueBusy = false;
+    assert.equal((await startLoad()).status, 202);
+    const retryCatalog = await (await fetch(`${base}/llama/models`)).json() as any;
+    assert.equal(retryCatalog.data[0].status.value, 'loading');
+    assert.equal(retryCatalog.data[0].status.failed, undefined);
+    assert.equal(retryCatalog.data[0].status.exit_code, undefined);
+    let completed = false;
+    for (let i = 0; i < 100; i++) {
+      const state = await (await fetch(`${base}/status`)).json() as any;
+      if (state.modelOperation?.state === 'complete') { completed = true; break; }
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.equal(completed, true, 'retry should complete after the upstream clears its failure state');
+    assert.equal(model, 'loaded');
+  } finally { await manager.close(); await close(upstream); await rm(cwd, { recursive: true, force: true }); }
+});
+
+test('model load returns acceptance before VRAM wait and retains the GPU gate until completion', async () => {
+  await mkdir('work', { recursive: true });
+  const cwd = await mkdtemp(join(process.cwd(), 'work', 'manager-async-model-'));
+  const release = deferred(); const waiting = deferred();
+  let model = 'unloaded';
+  const upstream = createServer((req, res) => {
+    const path = new URL(req.url ?? '/', 'http://upstream').pathname;
+    res.setHeader('content-type', 'application/json');
+    if (path === '/props') { res.end('{"models_autoload":false}'); return; }
+    if (path === '/models') { res.end(JSON.stringify({ data: [{ id: 'fixture-model', status: { value: model } }] })); return; }
+    if (path === '/models/load') { model = 'loaded'; res.end('{"success":true}'); return; }
+    res.statusCode = 404; res.end('{}');
+  });
+  const llamaUrl = await listen(upstream);
+  const manager = createManager({
+    ...parseManagerConfig({ comfyuiUrl: 'http://127.0.0.1:8188', llamaServerUrl: llamaUrl, stateDir: cwd, timeouts: { requestMs: 2_000, modelMs: 2_000, generationMs: 0, settleMs: 100, pollMs: 5 } }),
+    listenPort: 0,
+  }, {
+    comfy: { async queue() { return { running: [], pending: [] }; }, async free() {} } as any,
+    vram: { async read() { return { source: 'amdgpu' as const, device: 'card1', totalMiB: 1000, usedMiB: 500, freeMiB: 500 }; }, async waitForRelease() { waiting.resolve(); await release.promise; return { source: 'amdgpu' as const, device: 'card1', totalMiB: 1000, usedMiB: 100, freeMiB: 900 }; } },
+  });
+  try {
+    await manager.start();
+    const address = manager.server.address(); assert.ok(address && typeof address !== 'string');
+    const base = `http://127.0.0.1:${address.port}`;
+    const response = await fetch(`${base}/llama/models/load`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'fixture-model' }) });
+    assert.equal(response.status, 202);
+    await waiting.promise;
+    const catalog = await (await fetch(`${base}/llama/models`)).json() as any;
+    assert.equal(catalog.data[0].status.value, 'loading');
+    assert.equal(catalog.data[0].manager_operation.phase, 'waiting_for_vram');
+    const status = await (await fetch(`${base}/status`)).json() as any;
+    assert.equal(status.modelOperation.state, 'running');
+    assert.equal(status.managerPhase, 'model');
+    const competing = await fetch(`${base}/llama/models/load`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'fixture-model' }) });
+    assert.equal(competing.status, 409);
+    const cancel = await fetch(`${base}/cancel`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    assert.equal(cancel.status, 409);
+    release.resolve();
+    for (let i = 0; i < 100 && model !== 'loaded'; i++) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(model, 'loaded');
+    const complete = await (await fetch(`${base}/status`)).json() as any;
+    assert.equal(complete.modelOperation.state, 'complete');
+    assert.equal(complete.managerPhase, 'llm_ready');
+  } finally {
+    release.resolve(); await manager.close(); await close(upstream); await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test('standalone cancellation holds the GPU gate until persisted-run cleanup finishes', async () => {
+  await mkdir('work', { recursive: true });
+  const cwd = await mkdtemp(join(process.cwd(), 'work', 'manager-cancel-gate-'));
+  const cancelStarted = deferred(); const finishCancel = deferred();
+  const upstream = createServer((req, res) => {
+    const path = new URL(req.url ?? '/', 'http://upstream').pathname;
+    res.setHeader('content-type', 'application/json');
+    if (path === '/props') { res.end('{"models_autoload":false}'); return; }
+    if (path === '/models') { res.end('{"data":[{"id":"fixture-model","status":{"value":"loaded"}}]}'); return; }
+    res.statusCode = 404; res.end('{}');
+  });
+  const llamaUrl = await listen(upstream);
+  await writeFile(join(cwd, 'runner-state.json'), JSON.stringify({
+    version: 1, id: 'interrupted-run', phase: 'recovery_required', state: 'recovery_required', model: 'fixture-model',
+    promptId: 'fixture-prompt', completed: [], updatedAt: Date.now(), comfyuiUrl: 'http://127.0.0.1:8188',
+    llamaServerUrl: llamaUrl, snapshot: [{ name: 'fixture-model', status: 'loaded' }], workflows: [{}], index: 0,
+  }));
+  const manager = createManager({ ...parseManagerConfig({ comfyuiUrl: 'http://127.0.0.1:8188', llamaServerUrl: llamaUrl, stateDir: cwd, timeouts: { requestMs: 2_000, modelMs: 2_000, generationMs: 0, settleMs: 100, pollMs: 5 } }), listenPort: 0 }, {
+    comfy: { async queue() { return { running: [], pending: [] }; }, async cancel() { cancelStarted.resolve(); await finishCancel.promise; }, async free() {} } as any,
+    vram: { async read() { return { source: 'amdgpu' as const, device: 'card1', totalMiB: 1000, usedMiB: 100, freeMiB: 900 }; }, async waitForRelease() { return { source: 'amdgpu' as const, device: 'card1', totalMiB: 1000, usedMiB: 100, freeMiB: 900 }; } },
+  });
+  try {
+    await manager.start();
+    const address = manager.server.address(); assert.ok(address && typeof address !== 'string');
+    const base = `http://127.0.0.1:${address.port}`;
+    const sse = await fetch(`${base}/llama/models/sse`);
+    assert.equal(sse.status, 501);
+    const cancel = await fetch(`${base}/cancel`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    assert.equal(cancel.status, 202);
+    await cancelStarted.promise;
+    const load = await fetch(`${base}/llama/models/load`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'fixture-model' }) });
+    assert.equal(load.status, 409, 'model operation must not begin during cancellation cleanup');
+    finishCancel.resolve();
+    for (let i = 0; i < 100; i++) {
+      const state = await (await fetch(`${base}/status`)).json() as any;
+      if (state.state === 'cancelled') { assert.equal(state.managerPhase, 'llm_ready'); return; }
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.fail('standalone cancellation should release its gate after cleanup');
+  } finally { finishCancel.resolve(); await manager.close(); await close(upstream); await rm(cwd, { recursive: true, force: true }); }
 });
 
 test('a rejected preflight can be retried with the same job ID after loading the model', async () => {
@@ -206,7 +357,12 @@ test('a rejected preflight can be retried with the same job ID after loading the
     assert.match((await failed.json() as any).error.message, /unloaded/);
 
     const loaded = await fetch(`${base}/llama/models/load`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'fixture-model' }) });
-    assert.equal(loaded.status, 200);
+    assert.equal(loaded.status, 202);
+    for (let i = 0; i < 100; i++) {
+      const state = await (await fetch(`${base}/status`)).json() as any;
+      if (state.modelOperation?.state === 'complete') break;
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
     const retried = await fetch(`${base}/generate`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request) });
     assert.equal(retried.status, 202);
     assert.equal((await retried.json() as any).id, request.id);

@@ -177,10 +177,11 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
   const llama = dependencies.llama ?? new LlamaRouterClient(config.llamaServerUrl, {
     requestMs: config.timeouts.requestMs, modelMs: config.timeouts.modelMs, pollMs: config.timeouts.pollMs,
     apiKey: config.llamaApiKey,
+    onDiagnostic: message => logger.log('debug', `llama ${message}`),
   }) as LlamaRouterClient & LlamaAdapter;
   let vram = dependencies.vram;
   const waitForVramRelease = async (minFreeMiB?: number): Promise<void> => {
-    logger.log('info', `VRAM release wait begin${minFreeMiB === undefined ? '' : ` minFreeMiB=${minFreeMiB}`}`);
+    logger.log('info', `VRAM release wait begin mode=${minFreeMiB === undefined ? 'stability-only' : `minimum-free minFreeMiB=${minFreeMiB}`}`);
     let sampling = false;
     const sampleTimer = setInterval(() => {
       if (sampling || !vram || config.logLevel !== 'debug') return;
@@ -206,6 +207,8 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
   let acceptingInference = true;
   let inFlight = 0;
   let transition: 'generation' | 'model' | undefined;
+  const getTransition = (): 'generation' | 'model' | undefined => transition;
+  let modelOperationState: { operation: 'load' | 'unload'; model: string; state: 'accepted' | 'running' | 'complete' | 'failed'; phase: string; startedAt: number; elapsedMs: number; error?: string } | undefined;
   let ready = false;
   let job: { id: string; modelId?: string; workflows: Workflow[]; accepted: Promise<RunState>; task: Promise<RunState> } | undefined;
   let drainResolver: (() => void) | undefined;
@@ -213,6 +216,9 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
   const waitForInference = async (): Promise<void> => {
     while (inFlight > 0) await new Promise<void>(resolve => { drainResolver = resolve; });
   };
+  const activeOperationDetail = (): string => transition === 'model' && modelOperationState
+    ? `model "${modelOperationState.model}" phase=${modelOperationState.phase} elapsed=${Math.floor((Date.now() - modelOperationState.startedAt) / 1000)}s`
+    : `${transition ?? 'GPU'} operation is active`;
   const endInference = (): void => {
     inFlight--;
     if (inFlight === 0) { drainResolver?.(); drainResolver = undefined; }
@@ -222,7 +228,8 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
     let sample: unknown = { source: 'comfyui', available: false };
     try { sample = await vram?.read() ?? sample; }
     catch (error) { sample = { source: 'host', error: error instanceof Error ? error.message : 'VRAM telemetry unavailable' }; }
-    return { ...publicState(state), inferenceRequests: inFlight, vram: sample, managerPhase: transition ?? (acceptingInference ? 'llm_ready' : 'paused') };
+    const operation = modelOperationState ? { ...modelOperationState, elapsedMs: modelOperationState.state === 'complete' || modelOperationState.state === 'failed' ? modelOperationState.elapsedMs : Date.now() - modelOperationState.startedAt } : undefined;
+    return { ...publicState(state), inferenceRequests: inFlight, vram: sample, managerPhase: transition ?? (acceptingInference ? 'llm_ready' : 'paused'), ...(operation ? { modelOperation: operation } : {}) };
   };
   const updateGate = async (state?: RunState): Promise<void> => {
     const current = state ?? await runner.status();
@@ -263,7 +270,7 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
 
   const proxyInference = async (req: IncomingMessage, res: ServerResponse, path: string): Promise<void> => {
     if (!ready || !acceptingInference || transition || !authMatches(req, config.token)) {
-      sendError(res, 503, 'LLM inference is paused while GPU models are switching');
+      sendError(res, 503, `LLM inference is paused while GPU models are switching${transition ? ` (${activeOperationDetail()})` : ''}`);
       return;
     }
     inFlight++;
@@ -272,35 +279,79 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
   };
 
   const modelOperation = async (operation: 'load' | 'unload', name: unknown, res: ServerResponse): Promise<void> => {
-    if (transition || runner.isBusy) { sendError(res, 409, `Cannot ${operation} llama.cpp model${typeof name === 'string' ? ` "${name}"` : ''}: a GPU operation is already active`); return; }
     if (typeof name !== 'string' || !name.trim()) { sendError(res, 400, 'model is required'); return; }
+    if (transition || runner.isBusy) { sendError(res, 409, `Cannot ${operation} llama.cpp model "${name}": ${activeOperationDetail()}`); return; }
     transition = 'model'; acceptingInference = false;
-    logger.log('info', `model ${operation} begin; inference paused`);
-    try {
-      const runState = await runner.status();
-      if (runState.state === 'running' || runState.state === 'recovery_required') throw new Error('Recover the active generation before changing models');
-      await waitForInference();
-      const models = await llama.listModels();
-      const target = models.find(model => model.name === name);
-      if (!target) throw new Error(`llama-server model not found: ${name}`);
-      if (operation === 'load') {
+    const startedAt = Date.now();
+    const op: NonNullable<typeof modelOperationState> = modelOperationState = { operation, model: name, state: 'accepted', phase: 'preparing', startedAt, elapsedMs: 0 };
+    const log = (level: 'info' | 'error', phase: string, detail = '') => {
+      op.phase = phase;
+      logger.log(level, `model ${operation} model=${name} state=${op.state} phase=${phase} elapsed=${Math.floor((Date.now() - startedAt) / 1000)}s${detail ? ` ${detail}` : ''}`);
+    };
+    if (operation === 'unload') {
+      try {
+        const runState = await runner.status();
+        if (runState.state === 'running' || runState.state === 'recovery_required') throw new Error('Recover the active generation before changing models');
+        const models = await llama.listModels();
+        if (!models.some(model => model.name === name)) throw new Error(`llama-server model not found: ${name}`);
+        op.state = 'running'; log('info', 'llama_unload');
+        await waitForInference(); await llama.unload(name);
+        op.state = 'complete'; op.phase = 'unloaded'; op.elapsedMs = Date.now() - startedAt;
+        acceptingInference = true; transition = undefined; sendJson(res, 200, { success: true, model: name, status: 'unloaded' });
+      } catch (error) {
+        op.state = 'failed'; op.elapsedMs = Date.now() - startedAt; op.error = redactClientError(error);
+        acceptingInference = false; transition = undefined; log('error', 'failed', `error=${safeError(error)}`);
+        sendError(res, 409, `Cannot unload llama.cpp model: ${op.error}`);
+      }
+      return;
+    }
+    // Reading the local run journal is a bounded preflight. Preserve the existing
+    // recovery guard before acknowledging a model load, and check the reservation
+    // again after the await because another operation may have won the race.
+    let runState: Awaited<ReturnType<typeof runner.status>>;
+    try { runState = await runner.status(); }
+    catch (error) {
+      transition = undefined; acceptingInference = false;
+      op.state = 'failed'; op.phase = 'validation'; op.elapsedMs = Date.now() - startedAt; op.error = redactClientError(error);
+      sendError(res, 502, `Cannot load llama.cpp model: ${op.error}`); return;
+    }
+    if (transition !== 'model' || modelOperationState !== op) { sendError(res, 409, `Cannot load llama.cpp model "${name}": ${activeOperationDetail()}`); return; }
+    if (runState.state === 'running' || runState.state === 'recovery_required') {
+      transition = undefined; acceptingInference = false;
+      op.state = 'failed'; op.phase = 'validation'; op.elapsedMs = Date.now() - startedAt; op.error = 'Recover the active generation before changing models';
+      sendError(res, 409, op.error); return;
+    }
+    sendJson(res, 202, { success: true, model: name, status: 'accepted', operation, modelOperation: { state: op.state, phase: op.phase } });
+    const heartbeat = setInterval(() => log('info', op.phase), 10_000);
+    heartbeat.unref(); timers.add(heartbeat);
+    void (async () => {
+      try {
+        op.state = 'running';
+        log('info', 'validating');
+        const runState = await runner.status();
+        if (runState.state === 'running' || runState.state === 'recovery_required') throw new Error('Recover the active generation before changing models');
+        const models = await llama.listModels();
+        const target = models.find(model => model.name === name);
+        if (!target) throw new Error(`llama-server model not found: ${name}`);
         if (models.some(model => model.name !== target.name && model.status !== 'unloaded')) throw new Error('Other llama-server models are resident');
         if (target.status !== 'loaded') {
           const queue = await comfy.queue();
           if (queue.running.length || queue.pending.length) throw new Error('ComfyUI queue is not empty');
-          await comfy.free();
-          await waitForVramRelease();
         }
-        await llama.load(name);
-      } else await llama.unload(name);
-      acceptingInference = true; transition = undefined;
-      logger.log('info', `model ${operation} complete; inference resumed`);
-      sendJson(res, 200, { success: true, model: name, status: operation === 'load' ? 'loaded' : 'unloaded' });
-    } catch (error) {
-      acceptingInference = false; transition = undefined;
-      logger.log('error', `model ${operation} failed: ${safeError(error)}`);
-      sendError(res, 409, `Cannot ${operation} llama.cpp model: ${redactClientError(error)}`);
-    }
+        log('info', 'waiting_for_inference');
+        await waitForInference();
+        if (target.status !== 'loaded') {
+          log('info', 'freeing_comfyui'); await comfy.free();
+          log('info', 'waiting_for_vram'); await waitForVramRelease();
+        }
+        log('info', `llama_${operation}`); await llama[operation](name);
+        op.state = 'complete'; op.phase = operation === 'load' ? 'loaded' : 'unloaded'; op.elapsedMs = Date.now() - startedAt;
+        acceptingInference = true; transition = undefined; log('info', 'complete');
+      } catch (error) {
+        op.state = 'failed'; op.elapsedMs = Date.now() - startedAt; op.error = redactClientError(error);
+        acceptingInference = false; transition = undefined; log('error', op.phase, `error=${safeError(error)}`);
+      } finally { clearInterval(heartbeat); timers.delete(heartbeat); }
+    })();
   };
 
   const handler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
@@ -323,7 +374,8 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
           const state = await job.accepted;
           sendJson(res, state.state === 'complete' ? 200 : 202, { ...publicState(state), inferenceRequests: inFlight, vram: await vram?.read().catch(() => undefined) }); return;
         }
-        if (transition || runner.isBusy) { sendError(res, 409, 'A GPU operation is already active'); return; }
+        if (transition || runner.isBusy) { sendError(res, 409, `A GPU operation is already active (${activeOperationDetail()})`); return; }
+        modelOperationState = undefined;
         transition = 'generation'; acceptingInference = false;
         logger.log('info', `inference paused run=${body.id}`);
         let accept!: (state: RunState) => void;
@@ -382,21 +434,32 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
 
       if (path === '/cancel' && req.method === 'POST') {
         const body = await readJson(req);
+        if (getTransition() === 'model') { sendError(res, 409, 'Cannot cancel while a model operation is active'); return; }
         const current = await runner.status();
+        // A model operation can reserve the gate while status() reads the journal.
+        if (getTransition() === 'model') { sendError(res, 409, 'Cannot cancel while a model operation is active'); return; }
         if (record(body) && typeof body.id === 'string' && current.state !== 'idle' && body.id !== current.id) { sendError(res, 409, 'Unknown job ID'); return; }
+        // For cancellation of a persisted run after restart, hold the GPU gate
+        // until cleanup is confirmed. Active generation already owns its gate.
+        const ownsGate = !runner.isBusy && !transition;
+        if (ownsGate) { transition = 'generation'; acceptingInference = false; }
         logger.log('info', 'cancellation requested');
         void runner.cancel().then(async () => {
           // A standalone cancellation can finish recovery and restore the LLM.
           // Active generation owns its gate transition and will update it in its task handler.
-          if (!runner.isBusy) await updateGate();
-        }).catch(error => logger.log('error', `cancellation failed: ${safeError(error)}`));
+          if (ownsGate && transition === 'generation') await updateGate();
+        }).catch(error => {
+          logger.log('error', `cancellation failed: ${safeError(error)}`);
+          if (ownsGate && transition === 'generation') { acceptingInference = false; transition = undefined; }
+        });
         sendJson(res, 202, await stateWithMetrics()); return;
       }
       if (path === '/recover' && req.method === 'POST') {
         const body = await readJson(req);
         const current = await runner.status();
         if (record(body) && typeof body.id === 'string' && current.state !== 'idle' && body.id !== current.id) { sendError(res, 409, 'Unknown job ID'); return; }
-        if (transition || runner.isBusy) { sendError(res, 409, 'A GPU operation is already active'); return; }
+        if (transition || runner.isBusy) { sendError(res, 409, `A GPU operation is already active (${activeOperationDetail()})`); return; }
+        modelOperationState = undefined;
         transition = 'generation'; acceptingInference = false;
         logger.log('info', `recovery begin run=${current.state === 'idle' ? 'none' : current.id}`);
         const task = runner.recover();
@@ -406,7 +469,8 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
       if (path === '/connect' && req.method === 'POST') {
         const body = await readJson(req);
         if (!record(body)) { sendError(res, 400, 'Expected { modelId? }'); return; }
-        if (transition || runner.isBusy) { sendError(res, 409, 'A GPU operation is already active'); return; }
+        if (transition || runner.isBusy) { sendError(res, 409, `A GPU operation is already active (${activeOperationDetail()})`); return; }
+        modelOperationState = undefined;
         transition = 'model'; acceptingInference = false;
         logger.log('info', 'model connect begin; inference paused');
         const task = (async () => {
@@ -431,13 +495,41 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
 
       const llamaPath = path.startsWith('/llama/') ? path.slice('/llama'.length) : undefined;
       if (llamaPath && ['true', '1'].includes(url.searchParams.get('autoload') ?? '')) { sendError(res, 400, 'Router autoload is disabled'); return; }
+      if (llamaPath === '/models/sse' && req.method === 'GET') {
+        sendError(res, 501, 'Model status SSE is unavailable through the manager; use the model catalog polling endpoint'); return;
+      }
       if (llamaPath && isInference(llamaPath, req.method ?? 'GET')) { await proxyInference(req, res, `${llamaPath}${url.search}`); return; }
       if (llamaPath && managementPath(llamaPath) && req.method === 'POST') {
         const body = await readJson(req);
         if (!record(body)) { sendError(res, 400, 'Expected a model name'); return; }
         await modelOperation(llamaPath.endsWith('/load') ? 'load' : 'unload', body.model, res); return;
       }
-      if (llamaPath && req.method === 'GET' && ['/models', '/models/sse', '/v1/models', '/props', '/health'].includes(llamaPath)) {
+      if (llamaPath === '/models' && req.method === 'GET' && modelOperationState && (
+        ['accepted', 'running'].includes(modelOperationState.state) || (modelOperationState.state === 'failed' && modelOperationState.operation === 'load')
+      )) {
+        const operation = modelOperationState;
+        const upstream = await fetchImpl(withPrefix(config.llamaServerUrl, `${llamaPath}${url.search}`), { headers: config.llamaApiKey ? { authorization: `Bearer ${config.llamaApiKey}` } : undefined, redirect: 'error' });
+        const raw = await upstream.text();
+        if (!upstream.ok) { res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' }); res.end(raw); return; }
+        let payload: any;
+        try { payload = JSON.parse(raw); } catch { throw new Error('llama-server returned invalid model catalog JSON'); }
+        const rows = Array.isArray(payload) ? payload : Array.isArray(payload?.models) ? payload.models : payload?.data;
+        if (!Array.isArray(rows)) throw new Error('llama-server returned no model catalog');
+        if (modelOperationState !== operation) { sendJson(res, 200, payload); return; }
+        const existing = rows.find((row: any) => (row?.name ?? row?.id) === operation.model);
+        const status = operation.state === 'failed' ? 'unloaded' : operation.operation === 'load' ? 'loading' : 'unloading';
+        if (!existing) rows.push({ id: operation.model, name: operation.model, status: { value: status } });
+        const target = existing ?? rows[rows.length - 1];
+        const nestedStatus = typeof target.status === 'object' && target.status ? { ...target.status } : { value: status };
+        nestedStatus.value = status;
+        delete nestedStatus.failed; delete nestedStatus.exit_code; delete nestedStatus.error;
+        if (operation.state === 'failed') nestedStatus.failed = true;
+        target.status = nestedStatus;
+        target.manager_operation = { operation: operation.operation, state: operation.state, phase: operation.phase, elapsedMs: operation.state === 'failed' ? operation.elapsedMs : Date.now() - operation.startedAt, ...(operation.error ? { error: operation.error } : {}) };
+        if (operation.error) target.manager_error = operation.error;
+        sendJson(res, 200, payload); return;
+      }
+      if (llamaPath && req.method === 'GET' && ['/models', '/v1/models', '/props', '/health'].includes(llamaPath)) {
         await forward(req, res, config.llamaServerUrl, `${llamaPath}${url.search}`); return;
       }
       if (path.startsWith('/comfy/')) {

@@ -1,5 +1,5 @@
 export type Workflow = Record<string, { class_type: string; inputs: Record<string, unknown>; _meta?: Record<string, unknown> }>;
-export interface ModelState { name: string; status: string }
+export interface ModelState { name: string; status: string; failed?: boolean; error?: string; exitCode?: number }
 export interface LlamaAdapter {
   listModels(): Promise<ModelState[]>;
   /** Resolve only after status=loaded, never merely loading/sleeping. */

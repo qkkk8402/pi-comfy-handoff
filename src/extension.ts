@@ -342,6 +342,7 @@ export default function extension(pi: ExtensionAPI): void {
 
 function formatComfyStatus(state: RunState | undefined, local: LocalRun | undefined, managerUrl: string, modelId?: string): string {
   if (!state) return [`ComfyUI / VRAM manager`, `状態: 確認できません${local ? `（保存済み生成 ${local.id} の待機記録あり）` : ''}`, `接続先: ${managerUrl}`, `モデル: ${modelId ?? '未選択'}`, '次の操作: 接続設定からURLを確認してください。'].join('\n');
+  const modelOperation = state.modelOperation && typeof state.modelOperation === 'object' ? state.modelOperation as Record<string, unknown> : undefined;
   const vram = state.vram ?? state.vramUsed ?? state.vram_used;
   const vramText = typeof vram === 'number' ? `${Math.round(vram / (vram > 1024 * 1024 ? 1024 * 1024 : 1))} MiB`
     : vram && typeof vram === 'object' && ('usedMiB' in vram || 'freeMiB' in vram)
@@ -353,7 +354,11 @@ function formatComfyStatus(state: RunState | undefined, local: LocalRun | undefi
     : busy(state) ? 'メニューから待機を続けるか、必要なら生成をキャンセルできます。'
       : state.state === 'failed' ? 'エラーを確認し、必要ならComfyUIを復旧してください。'
         : '生成するには comfy_generate ツールを使えます。';
-  return [`ComfyUI / VRAM manager`, `状態: ${stateLabel[state.state] ?? state.state}`, `段階: ${state.phase ? phaseLabel[state.phase] ?? state.phase : '不明'}`, `管理サーバー: ${managerUrl}`, `モデル: ${modelId ?? '未選択'}`, `VRAM: ${vramText}`, ...(local ? [`Pi待機記録: ${local.id}`] : []), ...(state.error ? [`エラー: ${state.error}`] : []), `次の操作: ${action}`].join('\n');
+  const modelOperationLines = modelOperation ? [
+    `モデル操作: ${String(modelOperation.operation ?? 'unknown')} ${String(modelOperation.model ?? '')} / ${String(modelOperation.phase ?? modelOperation.state ?? 'unknown')} / ${Math.floor(Number(modelOperation.elapsedMs ?? 0) / 1000)}秒`,
+    ...(typeof modelOperation.error === 'string' ? [`モデル操作エラー: ${modelOperation.error}`] : []),
+  ] : [];
+  return [`ComfyUI / VRAM manager`, `状態: ${stateLabel[state.state] ?? state.state}`, `段階: ${state.phase ? phaseLabel[state.phase] ?? state.phase : '不明'}`, `管理サーバー: ${managerUrl}`, `モデル: ${modelId ?? '未選択'}`, `VRAM: ${vramText}`, ...modelOperationLines, ...(local ? [`Pi待機記録: ${local.id}`] : []), ...(state.error ? [`エラー: ${state.error}`] : []), `次の操作: ${action}`].join('\n');
 }
 
 function notifyRunResult(ctx: { ui: { notify(message: string, level?: string): void } }, value: unknown): void {

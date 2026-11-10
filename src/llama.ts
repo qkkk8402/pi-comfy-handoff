@@ -6,6 +6,7 @@ export interface LlamaRouterOptions {
   pollMs?: number;
   apiKey?: string;
   fetchImpl?: typeof fetch;
+  onDiagnostic?: (message: string) => void;
 }
 
 export class LlamaRouterError extends Error {
@@ -20,6 +21,7 @@ export class LlamaRouterClient implements LlamaAdapter {
   private readonly pollMs: number;
   private readonly fetchImpl: typeof fetch;
   private readonly headers: HeadersInit;
+  private readonly onDiagnostic?: (message: string) => void;
 
   constructor(baseUrl: string, options: LlamaRouterOptions = {}) {
     const url = new URL(baseUrl);
@@ -31,6 +33,7 @@ export class LlamaRouterClient implements LlamaAdapter {
     this.modelMs = options.modelMs ?? 300_000;
     this.pollMs = options.pollMs ?? 500;
     this.fetchImpl = options.fetchImpl ?? fetch;
+    this.onDiagnostic = options.onDiagnostic;
     this.headers = {
       accept: 'application/json',
       ...(options.apiKey ? { authorization: `Bearer ${options.apiKey}` } : {}),
@@ -55,7 +58,12 @@ export class LlamaRouterClient implements LlamaAdapter {
       if (!name || typeof statusValue !== 'string') {
         throw new LlamaRouterError('GET /models record is missing model name or status.value');
       }
-      return { name, status: statusValue.toLowerCase() };
+      return {
+        name, status: statusValue.toLowerCase(),
+        ...((nestedStatus && typeof nestedStatus === 'object' && (nestedStatus as Record<string, unknown>).failed === true) ? { failed: true } : {}),
+        ...((nestedStatus && typeof nestedStatus === 'object' && typeof (nestedStatus as Record<string, unknown>).error === 'string') ? { error: String((nestedStatus as Record<string, unknown>).error).slice(0, 500) } : {}),
+        ...((nestedStatus && typeof nestedStatus === 'object' && typeof (nestedStatus as Record<string, unknown>).exit_code === 'number') ? { exitCode: (nestedStatus as Record<string, unknown>).exit_code as number } : {}),
+      };
     });
   }
 
@@ -98,14 +106,23 @@ export class LlamaRouterClient implements LlamaAdapter {
     while (Date.now() < deadline) {
       const models = await this.listModels();
       const current = models.find((entry) => entry.name === name);
-      lastState = current?.status ?? 'absent';
+      const nextState = current?.status ?? 'absent';
+      if (nextState !== lastState) this.diagnostic(`model=${name} target=${target} state=${nextState}`);
+      lastState = nextState;
+      if (current?.failed || current?.status === 'failed') {
+        const detail = current.error ? `: ${current.error}` : current.exitCode === undefined ? '' : ` (exit code ${current.exitCode})`;
+        throw new LlamaRouterError(`${name} failed while waiting for ${target}; last state was ${lastState}${detail}`);
+      }
       if (lastState === target || (target === 'unloaded' && lastState === 'absent')) return;
       await new Promise((resolve) => setTimeout(resolve, Math.min(this.pollMs, Math.max(1, deadline - Date.now()))));
     }
+    this.diagnostic(`model=${name} target=${target} timeout=${this.modelMs}ms lastState=${lastState}`);
     throw new LlamaRouterError(`timed out waiting for ${name} to reach ${target}; last state was ${lastState}`);
   }
 
   private async request(path: string, init: RequestInit = {}): Promise<any> {
+    const method = init.method ?? 'GET';
+    const startedAt = Date.now();
     const controller = new AbortController();
     let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; controller.abort(new Error('request timeout')); }, this.requestMs);
@@ -123,21 +140,31 @@ export class LlamaRouterClient implements LlamaAdapter {
         catch { throw new LlamaRouterError(`${path} returned invalid JSON`); }
       }
       if (!response.ok) {
+        this.diagnostic(`${method} ${path} status=${response.status} elapsed=${Date.now() - startedAt}ms`);
         const message = typeof body?.error === 'string' ? body.error
           : typeof body?.error?.message === 'string' ? body.error.message
             : typeof body?.message === 'string' ? body.message : text || response.statusText;
         throw new LlamaRouterError(`${path} failed (${response.status}): ${String(message)}`);
       }
+      this.diagnostic(`${method} ${path} status=${response.status} elapsed=${Date.now() - startedAt}ms`);
       return body;
     } catch (error) {
       if (error instanceof LlamaRouterError) throw error;
       const target = new URL(`${this.baseUrl}${path}`);
-      if (controller.signal.aborted || timedOut) throw new LlamaRouterError(`Request to llama-server at ${target.origin}${target.pathname} timed out after ${this.requestMs}ms`);
+      if (controller.signal.aborted || timedOut) {
+        this.diagnostic(`${method} ${path} timeout=${this.requestMs}ms`);
+        throw new LlamaRouterError(`Request to llama-server at ${target.origin}${target.pathname} timed out after ${this.requestMs}ms`);
+      }
+      this.diagnostic(`${method} ${path} failed elapsed=${Date.now() - startedAt}ms`);
       const detail = error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300);
       const code = (error as Error & { cause?: NodeJS.ErrnoException })?.cause?.code;
       throw new LlamaRouterError(`Cannot reach llama-server at ${target.origin}${target.pathname}${code ? ` (${code})` : ''}: ${detail}. Check that the server is running and the URL, port, and network are correct.`);
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  private diagnostic(message: string): void {
+    try { this.onDiagnostic?.(message); } catch { /* diagnostics must not affect model operations */ }
   }
 }
