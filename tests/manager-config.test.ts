@@ -18,11 +18,12 @@ test('manager defaults to loopback and disables unbounded LLM autoload behavior'
   assert.equal(config.timeouts.generationMs, 0);
 });
 
-test('manager config validates endpoints, VRAM and remote bind authentication', () => {
+test('manager config validates endpoints, VRAM and optional remote bind authentication', () => {
   assert.throws(() => parseManagerConfig({ comfyuiUrl: 'file:///bad' }), /HTTP/);
   assert.throws(() => parseManagerConfig({ minFreeMiB: -1 }), /minFreeMiB/);
-  assert.throws(() => parseManagerConfig({ listenHost: '0.0.0.0' }), /COMFY_MANAGER_TOKEN/);
+  assert.equal(parseManagerConfig({ listenHost: '0.0.0.0' }).token, undefined);
   assert.throws(() => parseManagerConfig({ listenHost: '0.0.0.0' }, '/', { COMFY_MANAGER_TOKEN: 'short' }), /16 characters/);
+  assert.equal(parseManagerConfig({ listenHost: '0.0.0.0' }, '/', { COMFY_MANAGER_TOKEN: '' }).token, undefined);
   const config = parseManagerConfig({ listenHost: '0.0.0.0', tokenEnv: 'MANAGER_KEY' }, '/', { MANAGER_KEY: '0123456789abcdef' });
   assert.equal(config.token, '0123456789abcdef');
 });

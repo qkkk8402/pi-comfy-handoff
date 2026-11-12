@@ -39,7 +39,7 @@ npm run manager -- --host 127.0.0.1 --port 8090 \
 ```
 
 すべてのオプションは`npm run manager -- --help`で確認できます。起動オプションはJSON設定より優先され、JSON設定は既定値より優先されます。JSONを使う場合は`--config manager.json`を指定します。
-別ホストからPiを接続する場合は`--host`に公開するインターフェースを指定し、ホスト側に16文字以上の`COMFY_MANAGER_TOKEN`を設定し、Piの`/login llama.cpp`で同じトークンを入力してください。VRAM設定が必要な場合は`--gpu`と`--min-free-mib`を追加できます。
+別ホストからPiを接続する場合は`--host`に公開するインターフェースを指定します。認証トークンは省略できます。VRAM設定が必要な場合は`--gpu`と`--min-free-mib`を追加できます。
 
 ```json
 {
@@ -52,7 +52,7 @@ npm run manager -- --host 127.0.0.1 --port 8090 \
 
 AMDではGPU指定に`"gpu": "card1"`、NVIDIAではインデックスやUUIDを使います。対象GPUが1枚なら自動検出します。`minFreeMiB`でLLM復帰時に必要な空きVRAMを指定できます。
 
-`COMFY_MANAGER_TOKEN`を設定すると、管理プロセスへの接続にBearer認証を要求します。Piでは`/login llama.cpp`に管理プロセス用のトークンを入力してください。Pi側の`COMFY_MANAGER_TOKEN`設定は通常不要で、Piのログイン認証が一致する管理プロセスへ自動で共有されます。別ホストから接続する場合のネットワーク準備は利用環境側で行います。
+`COMFY_MANAGER_TOKEN`を設定すると、管理プロセスへの接続にBearer認証を要求します。Piから接続する場合は、Piの`/login llama.cpp`に管理プロセス用のトークンをAPIキーとして入力してください。トークンを使わない場合はAPIキーを空欄にします。環境変数が未設定または空の場合は認証なしで接続できます。外部ネットワークに公開する場合は、認証トークンの設定やファイアウォールなどでアクセスを制限してください。別ホストから接続する場合のネットワーク準備は利用環境側で行います。
 
 llama-serverやComfyUI自身に認証を設定した場合、ホスト側の`LLAMA_API_KEY`・`COMFYUI_API_KEY`にそれぞれ設定します。
 

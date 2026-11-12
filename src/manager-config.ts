@@ -36,9 +36,7 @@ export function parseManagerConfig(raw: Record<string, unknown>, cwd = process.c
   if (typeof listenHost !== 'string' || !listenHost.trim()) throw new Error('listenHost must be a hostname or IP address');
   const tokenEnv = raw.tokenEnv ?? 'COMFY_MANAGER_TOKEN';
   if (typeof tokenEnv !== 'string' || !tokenEnv.trim()) throw new Error('tokenEnv must be a nonempty environment variable name');
-  const token = env[tokenEnv];
-  const loopback = ['127.0.0.1', '::1', 'localhost'].includes(listenHost);
-  if (!loopback && !token) throw new Error(`Set ${tokenEnv} before binding the manager to a non-loopback address`);
+  const token = env[tokenEnv] || undefined;
   if (token !== undefined && token.length < 16) throw new Error(`${tokenEnv} must contain at least 16 characters`);
   const gpu = raw.gpu;
   if (gpu !== undefined && (typeof gpu !== 'string' || !gpu.trim())) throw new Error('gpu must be a device selector string');

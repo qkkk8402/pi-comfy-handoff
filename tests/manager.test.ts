@@ -131,6 +131,40 @@ test('manager gates new inference and drains a disconnected response before unlo
   }
 });
 
+test('manager permits tokenless non-loopback access and enforces configured bearer tokens', async () => {
+  await mkdir('work', { recursive: true });
+  const cwd = await mkdtemp(join(process.cwd(), 'work', 'manager-auth-'));
+  const makeManager = (token?: string) => createManager({
+    ...parseManagerConfig({ listenHost: '0.0.0.0', stateDir: cwd, logLevel: 'silent' }),
+    listenPort: 0, token,
+  }, {
+    fetchImpl: async () => new Response('{"models_autoload":false}', { status: 200 }),
+    comfy: {} as any,
+    llama: {} as any,
+    vram: {} as any,
+  });
+  const request = async (manager: ReturnType<typeof makeManager>, token?: string) => {
+    const address = manager.server.address(); assert.ok(address && typeof address !== 'string');
+    return fetch(`http://127.0.0.1:${address.port}/health`, token ? { headers: { authorization: `Bearer ${token}` } } : undefined);
+  };
+  const tokenless = makeManager();
+  const secured = makeManager('0123456789abcdef');
+  try {
+    await tokenless.start();
+    assert.equal((await request(tokenless)).status, 200);
+    await tokenless.close();
+
+    await secured.start();
+    assert.equal((await request(secured)).status, 401);
+    assert.equal((await request(secured, 'wrong-token-value')).status, 401);
+    assert.equal((await request(secured, '0123456789abcdef')).status, 200);
+  } finally {
+    await tokenless.close();
+    await secured.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test('model operation errors retain diagnostics while redacting configured credentials', async () => {
   await mkdir('work', { recursive: true });
   const cwd = await mkdtemp(join(process.cwd(), 'work', 'manager-redaction-'));

@@ -119,10 +119,6 @@ async function readResponse(response: Response): Promise<unknown> {
   catch { throw new Error('Upstream returned invalid JSON'); }
 }
 
-function isLoopback(host: string): boolean {
-  return host === 'localhost' || host === '127.0.0.1' || host === '::1';
-}
-
 function isInference(path: string, method: string): boolean {
   return method === 'POST' && ['/v1/chat/completions', '/v1/completions', '/completion'].includes(path);
 }
@@ -143,7 +139,6 @@ function publicState<T extends RunState | { state: 'idle'; phase: 'idle' }>(stat
 }
 
 export function createManager(config: ManagerConfig, dependencies: ManagerDependencies = {}): ManagerServer {
-  if (!isLoopback(config.listenHost) && !config.token) throw new Error('A bearer token is required when the manager listens on a non-loopback address');
   const fetchImpl = dependencies.fetchImpl ?? fetch;
   const logger = new ManagerLogger(config.logLevel ?? 'info', dependencies.logSink);
   const timers = new Set<NodeJS.Timeout>();
