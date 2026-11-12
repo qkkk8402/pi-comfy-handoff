@@ -72,6 +72,32 @@ export class ManagerClient {
     return await this.json('/connect', { method: 'POST', body: JSON.stringify(modelId ? { modelId } : {}) });
   }
 
+  async listWorkflows(): Promise<string[]> {
+    const value = await this.json('/workflows');
+    if (!Array.isArray(value) || value.some(item => typeof item !== 'string')) {
+      throw new Error('VRAM manager /workflows returned an invalid workflow list; expected an array of strings');
+    }
+    const paths: string[] = [];
+    for (const name of value as string[]) {
+      const path = `workflows/${name}`;
+      const components = path.split('/');
+      if (!path.endsWith('.json') || components[0] !== 'workflows' || components.length < 2 ||
+          components.some(part => !part || part === '.' || part === '..' || part.includes('%') || part.includes('\\') || /[\u0000-\u001f\u007f]/.test(part))) continue;
+      paths.push(path);
+    }
+    return paths;
+  }
+
+  async getWorkflow(path: string): Promise<unknown> {
+    return await this.json(`/workflows/${encodeURIComponent(path)}`);
+  }
+
+  async saveWorkflow(path: string, workflow: unknown, overwrite: boolean): Promise<unknown> {
+    return await this.json(`/workflows/${encodeURIComponent(path)}?overwrite=${overwrite}`, {
+      method: 'POST', body: JSON.stringify(workflow),
+    });
+  }
+
   async statePath(): Promise<string> {
     const path = join(this.config.stateDir, 'manager-run.json');
     await mkdir(dirname(path), { recursive: true });

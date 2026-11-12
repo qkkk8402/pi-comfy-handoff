@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, rm, writeFile, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import extension from '../src/extension.js';
 
-const comfyTools = ['comfy_upload', 'comfy_inspect', 'comfy_workflow', 'comfy_validate', 'comfy_generate'];
+const comfyTools = ['comfy_upload', 'comfy_inspect', 'comfy_workflow', 'comfy_server_workflow', 'comfy_validate', 'comfy_generate'];
 
 function harness(initial: string[] = [...comfyTools, 'read', 'bash']) {
   const tools = new Map<string, any>();
@@ -52,11 +52,58 @@ test('disabled tools are removed on startup and next turn, other tools stay acti
     assert.deepEqual(ctx.calls, []);
     for (const [name, args] of [
       ['comfy_upload', { path: 'x' }], ['comfy_inspect', {}], ['comfy_workflow', { action: 'inspect', path: 'x' }],
-      ['comfy_validate', { path: 'x' }], ['comfy_generate', { path: 'x' }],
+      ['comfy_server_workflow', { action: 'list' }], ['comfy_validate', { path: 'x' }], ['comfy_generate', { path: 'x' }],
     ] as const) {
       await assert.rejects(h.tools.get(name).execute('id', args, undefined, undefined, ctx), /disabled/);
     }
     assert.equal(httpCalls, 0);
+  } finally { await rm(cwd, { recursive: true, force: true }); }
+});
+
+test('server workflow tool normalizes listing paths, preserves UI JSON, controls overwrite and exposes manager errors', async t => {
+  const cwd = await mkdtemp(join(process.cwd(), 'work', 'server-workflow-tool-'));
+  try {
+    await mkdir(join(cwd, '.pi'), { recursive: true });
+    await writeFile(join(cwd, '.pi/comfyui.json'), JSON.stringify({ managerUrl: 'http://manager.example:8090' }));
+    const h = harness();
+    const uiWorkflow = { nodes: [{ id: 1, type: 'SaveImage', widgets_values: ['image'] }], links: [], extra: { note: 'keep UI format' } };
+    const requests: Array<{ url: string; method: string; body?: unknown }> = [];
+    t.mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      let body: unknown;
+      if (typeof init?.body === 'string') body = JSON.parse(init.body);
+      requests.push({ url, method, body });
+      if (url.endsWith('/workflows') && method === 'GET') return Response.json(['sub folder/a.json', 'readme.txt', 'nested/b.json']);
+      if (url.endsWith('/workflows/workflows%2Fsub%20folder%2Fa.json') && method === 'GET') return Response.json(uiWorkflow);
+      if (method === 'POST' && url.includes('conflict.json') && url.endsWith('?overwrite=false')) return Response.json({ error: { message: 'file exists' } }, { status: 409 });
+      if (method === 'POST' && url.endsWith('?overwrite=false')) return Response.json({ saved: true });
+      if (method === 'POST' && url.endsWith('?overwrite=true')) return Response.json({ saved: true, overwritten: true });
+      if (url.endsWith('/workflows/workflows%2Funauthorized.json')) return Response.json({ error: { message: 'unauthorized' } }, { status: 401 });
+      if (url.endsWith('/workflows/workflows%2Fmissing.json')) return Response.json({ error: { message: 'workflow missing' } }, { status: 404 });
+      return Response.json({ error: { message: `unexpected ${method} ${url}` } }, { status: 500 });
+    });
+    const ctx = context(cwd);
+    const tool = h.tools.get('comfy_server_workflow');
+    const listResult = await tool.execute('list', { action: 'list' }, undefined, undefined, ctx);
+    assert.deepEqual(listResult.details, ['workflows/sub folder/a.json', 'workflows/nested/b.json']);
+    const path = (listResult.details as string[])[0]!;
+    const getResult = await tool.execute('get', { action: 'get', path }, undefined, undefined, ctx);
+    assert.deepEqual(getResult.details, uiWorkflow);
+    await tool.execute('save-default', { action: 'save', path, workflow: uiWorkflow }, undefined, undefined, ctx);
+    await tool.execute('save-overwrite', { action: 'save', path, workflow: uiWorkflow, overwrite: true }, undefined, undefined, ctx);
+    assert.deepEqual(requests.slice(0, 4).map(({ url, method }) => [url, method]), [
+      ['http://manager.example:8090/workflows', 'GET'],
+      ['http://manager.example:8090/workflows/workflows%2Fsub%20folder%2Fa.json', 'GET'],
+      ['http://manager.example:8090/workflows/workflows%2Fsub%20folder%2Fa.json?overwrite=false', 'POST'],
+      ['http://manager.example:8090/workflows/workflows%2Fsub%20folder%2Fa.json?overwrite=true', 'POST'],
+    ]);
+    assert.deepEqual(requests[2]!.body, uiWorkflow);
+    assert.deepEqual(requests[3]!.body, uiWorkflow);
+    await assert.rejects(tool.execute('unauthorized', { action: 'get', path: 'workflows/unauthorized.json' }, undefined, undefined, ctx), /HTTP 401: unauthorized/);
+    await assert.rejects(tool.execute('missing', { action: 'get', path: 'workflows/missing.json' }, undefined, undefined, ctx), /HTTP 404: workflow missing/);
+    await assert.rejects(tool.execute('conflict', { action: 'save', path: 'workflows/conflict.json', workflow: uiWorkflow }, undefined, undefined, ctx), /HTTP 409: file exists/);
+    await tool.execute('conflict-overwrite', { action: 'save', path: 'workflows/conflict.json', workflow: uiWorkflow, overwrite: true }, undefined, undefined, ctx);
   } finally { await rm(cwd, { recursive: true, force: true }); }
 });
 

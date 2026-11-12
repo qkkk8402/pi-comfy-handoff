@@ -165,6 +165,75 @@ test('manager permits tokenless non-loopback access and enforces configured bear
   }
 });
 
+test('manager exposes only saved workflow JSON paths and forwards authenticated list/get/save requests', async () => {
+  await mkdir('work', { recursive: true });
+  const cwd = await mkdtemp(join(process.cwd(), 'work', 'manager-workflows-'));
+  const forwarded: Array<{ url: string; method: string; auth: string | null; body?: string }> = [];
+  const manager = createManager({
+    ...parseManagerConfig({ comfyuiUrl: 'http://comfy.test:8188', stateDir: cwd, logLevel: 'silent' }),
+    listenPort: 0, comfyApiKey: 'comfy-secret',
+  }, {
+    fetchImpl: async (input, init = {}) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/props') return new Response('{"models_autoload":false}');
+      const headers = new Headers(init.headers);
+      let body: string | undefined;
+      if (init.body) body = await new Response(init.body as BodyInit).text();
+      forwarded.push({ url: url.toString(), method: init.method ?? 'GET', auth: headers.get('authorization'), body });
+      if (init.method === 'POST' && url.pathname.endsWith(encodeURIComponent('workflows/sub folder/a.json')) && url.searchParams.get('overwrite') === 'false') {
+        return new Response('{"error":{"message":"file already exists"}}', { status: 409, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(init.method === 'GET' ? '["sub folder/a.json","notes.txt"]' : '{"success":true}', { headers: { 'content-type': 'application/json' } });
+    },
+    comfy: {} as any, llama: {} as any, vram: {} as any,
+  });
+  try {
+    await manager.start();
+    const address = manager.server.address(); assert.ok(address && typeof address !== 'string');
+    const base = `http://127.0.0.1:${address.port}`;
+    const listing = await fetch(`${base}/workflows`);
+    assert.equal(listing.status, 200);
+    assert.deepEqual(await listing.json(), ['sub folder/a.json', 'notes.txt']);
+    const serverPath = 'workflows/sub folder/a.json';
+    const get = await fetch(`${base}/workflows/${encodeURIComponent(serverPath)}`);
+    assert.equal(get.status, 200);
+    const conflict = await fetch(`${base}/workflows/${encodeURIComponent(serverPath)}?overwrite=false`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"nodes":[]}',
+    });
+    assert.equal(conflict.status, 409);
+    assert.match(await conflict.text(), /file already exists/);
+    const overwrite = await fetch(`${base}/workflows/${encodeURIComponent(serverPath)}?overwrite=true`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"nodes":[]}',
+    });
+    assert.equal(overwrite.status, 200);
+    assert.equal(forwarded.length, 4);
+    assert.equal(forwarded[0]!.url, 'http://comfy.test:8188/userdata?dir=workflows&recurse=true');
+    assert.equal(forwarded[1]!.url, `http://comfy.test:8188/userdata/${encodeURIComponent(serverPath)}`);
+    assert.equal(forwarded[2]!.url, `http://comfy.test:8188/userdata/${encodeURIComponent(serverPath)}?overwrite=false`);
+    assert.equal(forwarded[3]!.url, `http://comfy.test:8188/userdata/${encodeURIComponent(serverPath)}?overwrite=true`);
+    assert.ok(forwarded.every(item => item.auth === 'Bearer comfy-secret'));
+    assert.equal(forwarded[2]!.body, '{"nodes":[]}');
+    const traversal = await fetch(`${base}/workflows/${encodeURIComponent('workflows/../secret.json')}`);
+    assert.equal(traversal.status, 400);
+    const doubleEncoded = await fetch(`${base}/workflows/workflows%252f..%252fsecret.json`);
+    assert.equal(doubleEncoded.status, 400);
+    const invalidListing = await fetch(`${base}/workflows?dir=outputs`);
+    assert.equal(invalidListing.status, 400);
+    const invalidJson = await fetch(`${base}/workflows/${encodeURIComponent(serverPath)}?overwrite=false`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: 'not-json',
+    });
+    assert.equal(invalidJson.status, 400);
+    const invalidOverwrite = await fetch(`${base}/workflows/${encodeURIComponent(serverPath)}?overwrite=yes`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+    assert.equal(invalidOverwrite.status, 400);
+    assert.equal(forwarded.length, 4, 'invalid routes must not reach ComfyUI');
+  } finally {
+    await manager.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test('model operation errors retain diagnostics while redacting configured credentials', async () => {
   await mkdir('work', { recursive: true });
   const cwd = await mkdtemp(join(process.cwd(), 'work', 'manager-redaction-'));

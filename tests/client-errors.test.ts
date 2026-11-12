@@ -18,6 +18,15 @@ test('manager client displays nested and legacy HTTP error messages with endpoin
   }
 });
 
+test('manager workflow listing requires string paths and returns directly usable JSON paths', async () => {
+  const valid = new ManagerClient(config(), async () => Response.json(['portrait.json', 'nested/scene.json', 'workflows/scene.json', 'readme.txt', '../private.json', 'encoded%2fsecret.json']));
+  assert.deepEqual(await valid.listWorkflows(), ['workflows/portrait.json', 'workflows/nested/scene.json', 'workflows/workflows/scene.json']);
+  const malformed = new ManagerClient(config(), async () => Response.json({ files: ['portrait.json'] }));
+  await assert.rejects(malformed.listWorkflows(), /\/workflows returned an invalid workflow list; expected an array of strings/);
+  const mixed = new ManagerClient(config(), async () => Response.json(['portrait.json', 4]));
+  await assert.rejects(mixed.listWorkflows(), /expected an array of strings/);
+});
+
 test('manager network errors show the socket cause code and timeout while preserving caller abort', async () => {
   const networkError = new TypeError('fetch failed', { cause: Object.assign(new Error('refused'), { code: 'ECONNREFUSED' }) });
   const unreachable = new ManagerClient(config(), async () => { throw networkError; });

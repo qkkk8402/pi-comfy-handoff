@@ -10,7 +10,7 @@ import type { Workflow } from './types.js';
 
 const text = (value: unknown): { content: [{ type: 'text'; text: string }]; details: unknown; terminate?: boolean } => ({ content: [{ type: 'text' as const, text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }], details: value });
 const TERMINAL = new Set(['complete', 'failed', 'cancelled']);
-const COMFY_TOOLS = ['comfy_upload', 'comfy_inspect', 'comfy_workflow', 'comfy_validate', 'comfy_generate'] as const;
+const COMFY_TOOLS = ['comfy_upload', 'comfy_inspect', 'comfy_workflow', 'comfy_server_workflow', 'comfy_validate', 'comfy_generate'] as const;
 interface LocalRun { version: 1; id: string; startedAt: number; downloaded: Record<string, string> }
 interface Runtime { manager: ManagerClient; comfy: ComfyClient }
 interface SetupContext extends AuthContext { cwd: string; isIdle(): boolean; ui: { input(prompt: string, value: string): Promise<string | undefined>; notify(message: string, level?: string): void } }
@@ -110,6 +110,23 @@ export default function extension(pi: ExtensionAPI): void {
       if (!check.valid) throw new Error(JSON.stringify(check.errors));
       const path = await writeProjectJson(ctx.cwd, args.path, workflow);
       return text({ path, summary: summarizeApiWorkflow(workflow), validation: 'Structure checked; use comfy_validate to check live node definitions before generating.' });
+    },
+  });
+  pi.registerTool({
+    name: 'comfy_server_workflow', label: 'Manage saved ComfyUI workflows', executionMode: 'sequential',
+    description: 'List, retrieve, or save JSON workflow files on the ComfyUI server under its workflows/ directory. The list action returns paths ready to pass directly to get/save (for example workflows/portrait.json). Preserves UI-format workflow JSON without converting it to the API format required for generation. Saving an existing file requires overwrite=true.',
+    parameters: Type.Object({
+      action: Type.Union([Type.Literal('list'), Type.Literal('get'), Type.Literal('save')]),
+      path: Type.Optional(Type.String()), workflow: Type.Optional(Type.Unknown()), overwrite: Type.Optional(Type.Boolean()),
+    }),
+    async execute(_id, args, _signal, _update, ctx) {
+      requireEnabled(ctx.cwd);
+      const { manager } = await refreshAuth(ctx, ctx.cwd);
+      if (args.action === 'list') return text(await manager.listWorkflows());
+      if (!args.path) throw new Error('path is required for get and save; use a path under workflows/ ending in .json');
+      if (args.action === 'get') return text(await manager.getWorkflow(args.path));
+      if (args.workflow === undefined) throw new Error('workflow is required for save');
+      return text(await manager.saveWorkflow(args.path, args.workflow, args.overwrite ?? false));
     },
   });
   pi.registerTool({

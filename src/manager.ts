@@ -127,6 +127,18 @@ function managementPath(path: string): boolean {
   return path === '/models/load' || path === '/models/unload';
 }
 
+function storedWorkflowPath(encoded: string): string | undefined {
+  let decoded: string;
+  try { decoded = decodeURIComponent(encoded); } catch { return undefined; }
+  // ComfyUI unquotes its userdata path again. Reject percent signs to prevent
+  // double-encoded traversal and keep the only exposed directory unambiguous.
+  if (decoded.includes('%') || decoded.includes('\\') || /[\u0000-\u001f\u007f]/.test(decoded)) return undefined;
+  const parts = decoded.split('/');
+  if (parts[0] !== 'workflows' || parts.length < 2 || parts.some(part => !part || part === '.' || part === '..')) return undefined;
+  if (!parts.at(-1)?.endsWith('.json')) return undefined;
+  return decoded;
+}
+
 function publicState<T extends RunState | { state: 'idle'; phase: 'idle' }>(state: T): T {
   if (!('completed' in state)) return state;
   const completed = state.completed.map(item => ({ ...item, outputs: item.outputs.map(output => {
@@ -233,7 +245,7 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
     transition = undefined;
     if (wasAccepting !== acceptingInference) logger.log('info', `inference ${acceptingInference ? 'resumed' : 'paused'} run=${'id' in current ? current.id : 'none'} state=${current.state}`);
   };
-  const forward = async (req: IncomingMessage, res: ServerResponse, base: string, path: string, keepReading = false): Promise<void> => {
+  const forward = async (req: IncomingMessage, res: ServerResponse, base: string, path: string, keepReading = false, rawBody?: string): Promise<void> => {
     const headers = new Headers();
     for (const name of ['accept', 'content-type', 'range']) {
       const value = req.headers[name];
@@ -242,7 +254,8 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
     if (base === config.llamaServerUrl && config.llamaApiKey) headers.set('authorization', `Bearer ${config.llamaApiKey}`);
     if (base === config.comfyuiUrl && config.comfyApiKey) headers.set('authorization', `Bearer ${config.comfyApiKey}`);
     const hasBody = req.method !== 'GET' && req.method !== 'HEAD';
-    const body = hasBody ? Readable.toWeb(req) as ReadableStream<Uint8Array> : undefined;
+    const streamedBody = hasBody && rawBody === undefined;
+    const body = rawBody ?? (streamedBody ? Readable.toWeb(req) as ReadableStream<Uint8Array> : undefined);
     let response: Response;
     const upstreamUrl = withPrefix(base, path);
     try {
@@ -250,7 +263,7 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
         method: req.method,
         headers,
         body,
-        ...(body ? { duplex: 'half' } as RequestInit : {}),
+        ...(streamedBody ? { duplex: 'half' } as RequestInit : {}),
         redirect: 'error',
       });
     } catch (error) {
@@ -356,6 +369,33 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
       if (!authMatches(req, config.token)) { sendError(res, 401, 'Bearer token required'); return; }
       if (path === '/health' && req.method === 'GET') { sendJson(res, ready ? 200 : 503, { ready }); return; }
       if (path === '/status' && req.method === 'GET') { sendJson(res, 200, await stateWithMetrics()); return; }
+
+      if (path === '/workflows' && req.method === 'GET') {
+        if (url.search) { sendError(res, 400, 'Workflow listing does not accept options'); return; }
+        await forward(req, res, config.comfyuiUrl, '/userdata?dir=workflows&recurse=true'); return;
+      }
+      if (path.startsWith('/workflows/')) {
+        const workflowPath = storedWorkflowPath(path.slice('/workflows/'.length));
+        if (!workflowPath) { sendError(res, 400, 'Workflow path must be a .json file under workflows/'); return; }
+        if (req.method === 'GET' && !url.search) {
+          await forward(req, res, config.comfyuiUrl, `/userdata/${encodeURIComponent(workflowPath)}`); return;
+        }
+        if (req.method === 'POST') {
+          const overwriteValues = url.searchParams.getAll('overwrite');
+          if ([...url.searchParams.keys()].length !== 1 || overwriteValues.length !== 1 || !['true', 'false'].includes(overwriteValues[0]!)) {
+            sendError(res, 400, 'POST requires exactly one overwrite=true or overwrite=false option'); return;
+          }
+          let body: unknown;
+          try { body = await readJson(req); }
+          catch (error) {
+            if (error instanceof Error && error.message.includes('10 MiB')) throw new HttpError(413, error.message);
+            throw new HttpError(400, 'Workflow body must be valid JSON');
+          }
+          if (!record(body)) { sendError(res, 400, 'Workflow body must be a JSON object'); return; }
+          await forward(req, res, config.comfyuiUrl, `/userdata/${encodeURIComponent(workflowPath)}?overwrite=${overwriteValues[0]}`, false, JSON.stringify(body)); return;
+        }
+        sendError(res, 405, 'Method not allowed'); return;
+      }
 
       if (path === '/generate' && req.method === 'POST') {
         const body = await readJson(req);
@@ -545,8 +585,8 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
   const server = createServer((req, res) => {
     const startedAt = Date.now();
     const requestedPath = (req.url ?? '/').split('?')[0]!;
-    const safePaths = new Set(['/health', '/status', '/generate', '/cancel', '/recover', '/connect', '/llama/v1/chat/completions', '/llama/v1/completions', '/llama/completion', '/llama/models', '/llama/models/sse', '/llama/v1/models', '/llama/props', '/llama/health', '/llama/models/load', '/llama/models/unload', '/comfy/object_info', '/comfy/view', '/comfy/upload/image']);
-    const path = safePaths.has(requestedPath) ? requestedPath : '<unknown>';
+    const safePaths = new Set(['/health', '/status', '/generate', '/cancel', '/recover', '/connect', '/workflows', '/llama/v1/chat/completions', '/llama/v1/completions', '/llama/completion', '/llama/models', '/llama/models/sse', '/llama/v1/models', '/llama/props', '/llama/health', '/llama/models/load', '/llama/models/unload', '/comfy/object_info', '/comfy/view', '/comfy/upload/image']);
+    const path = safePaths.has(requestedPath) ? requestedPath : requestedPath.startsWith('/workflows/') ? '/workflows/<file>' : '<unknown>';
     void handler(req, res).finally(() => logger.log('debug', `http ${req.method ?? 'GET'} ${path} status=${res.statusCode} duration=${Date.now() - startedAt}ms`));
   });
   return {
