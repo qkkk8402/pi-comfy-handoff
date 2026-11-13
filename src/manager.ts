@@ -184,7 +184,7 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
   const llama = dependencies.llama ?? new LlamaRouterClient(config.llamaServerUrl, {
     requestMs: config.timeouts.requestMs, modelMs: config.timeouts.modelMs, pollMs: config.timeouts.pollMs,
     apiKey: config.llamaApiKey,
-    onDiagnostic: message => logger.log('debug', `llama ${message}`),
+    onDiagnostic: message => logger.log(/retry=1|recoveredAfter=|retryFailed=|failed elapsed=.*(?:code=|cause=)|timeout=.*cause=/.test(message) ? 'info' : 'debug', `llama ${redactClientError(message)}`),
   }) as LlamaRouterClient & LlamaAdapter;
   let vram = dependencies.vram;
   const waitForVramRelease = async (minFreeMiB?: number): Promise<void> => {
@@ -300,6 +300,7 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
       try {
         const runState = await runner.status();
         if (runState.state === 'running' || runState.state === 'recovery_required') throw new Error('Recover the active generation before changing models');
+        log('info', 'checking_model_catalog');
         const models = await llama.listModels();
         if (!models.some(model => model.name === name)) throw new Error(`llama-server model not found: ${name}`);
         op.state = 'running'; log('info', 'llama_unload');
@@ -338,6 +339,7 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
         log('info', 'validating');
         const runState = await runner.status();
         if (runState.state === 'running' || runState.state === 'recovery_required') throw new Error('Recover the active generation before changing models');
+        log('info', 'checking_model_catalog');
         const models = await llama.listModels();
         const target = models.find(model => model.name === name);
         if (!target) throw new Error(`llama-server model not found: ${name}`);
@@ -513,6 +515,7 @@ export function createManager(config: ManagerConfig, dependencies: ManagerDepend
           if (runState.state === 'running' || runState.state === 'recovery_required') throw new Error('Recover the active generation before connecting a model');
           await waitForInference();
           const modelId = typeof body.modelId === 'string' ? body.modelId : undefined;
+          logger.log('info', 'model connect phase=checking_model_catalog');
           const models = await llama.listModels();
           const target = modelId ? models.find(model => model.name === modelId) : models.find(model => model.status === 'loaded');
           if (target?.status !== 'loaded') {

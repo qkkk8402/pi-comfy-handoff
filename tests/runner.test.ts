@@ -35,6 +35,18 @@ async function setup(fn: (runner: Runner, llama: Llama, comfy: Comfy, config: Ho
   } finally { await rm(stateDir, { recursive: true, force: true }); }
 }
 
+test('generation reports the llama model catalog stage when initial preflight fails', async () => {
+  await setup(async (runner, llama) => {
+    const cause = new Error('request failed code=ECONNRESET cause=socket closed');
+    llama.listModels = async () => { throw cause; };
+    await assert.rejects(runner.generate([workflow]), error => {
+      assert.match((error as Error).message, /Generation preflight failed at llama model catalog/);
+      assert.equal((error as Error & { cause?: unknown }).cause, cause);
+      return true;
+    });
+  });
+});
+
 test('single and batch generation unloads once, frees ComfyUI, then restores the loaded model', async () => {
   await setup(async (runner, llama, comfy) => {
     const state = await runner.generate([workflow, workflow]);

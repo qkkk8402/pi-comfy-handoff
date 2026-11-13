@@ -13,6 +13,24 @@ export class LlamaRouterError extends Error {
   override name = 'LlamaRouterError';
 }
 
+const retryableCodes = new Set(['UND_ERR_SOCKET', 'ECONNRESET', 'EPIPE']);
+
+function errorCause(error: unknown): unknown {
+  return error && typeof error === 'object' && 'cause' in error ? (error as { cause?: unknown }).cause : undefined;
+}
+
+function causeCode(error: unknown): string | undefined {
+  const seen = new Set<unknown>();
+  for (let current = error; current && !seen.has(current); current = errorCause(current)) {
+    seen.add(current);
+    if (typeof current === 'object' && current !== null && 'code' in current && typeof (current as { code?: unknown }).code === 'string') {
+      const code = (current as { code: string }).code;
+      return /^[A-Za-z0-9_]{1,64}$/.test(code) ? code : undefined;
+    }
+  }
+  return undefined;
+}
+
 /** llama-server router API. Model operations wait for the exact terminal state. */
 export class LlamaRouterClient implements LlamaAdapter {
   private readonly baseUrl: string;
@@ -21,6 +39,7 @@ export class LlamaRouterClient implements LlamaAdapter {
   private readonly pollMs: number;
   private readonly fetchImpl: typeof fetch;
   private readonly headers: HeadersInit;
+  private readonly apiKey?: string;
   private readonly onDiagnostic?: (message: string) => void;
 
   constructor(baseUrl: string, options: LlamaRouterOptions = {}) {
@@ -34,6 +53,7 @@ export class LlamaRouterClient implements LlamaAdapter {
     this.pollMs = options.pollMs ?? 500;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.onDiagnostic = options.onDiagnostic;
+    this.apiKey = options.apiKey;
     this.headers = {
       accept: 'application/json',
       ...(options.apiKey ? { authorization: `Bearer ${options.apiKey}` } : {}),
@@ -123,45 +143,82 @@ export class LlamaRouterClient implements LlamaAdapter {
   private async request(path: string, init: RequestInit = {}): Promise<any> {
     const method = init.method ?? 'GET';
     const startedAt = Date.now();
-    const controller = new AbortController();
-    let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; controller.abort(new Error('request timeout')); }, this.requestMs);
-    try {
-      const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
-        ...init,
-        redirect: 'error',
-        headers: { ...this.headers, ...(init.body ? { 'content-type': 'application/json' } : {}), ...init.headers },
-        signal: controller.signal,
-      });
-      const text = await response.text();
-      let body: any = undefined;
-      if (text) {
-        try { body = JSON.parse(text); }
-        catch { throw new LlamaRouterError(`${path} returned invalid JSON`); }
+    const target = new URL(`${this.baseUrl}${path}`);
+    const deadline = startedAt + this.requestMs;
+    let retryCode: string | undefined;
+    let attempt = 0;
+    while (true) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new LlamaRouterError(`Request to llama-server at ${target.origin}${target.pathname} timed out after ${this.requestMs}ms`);
+      const controller = new AbortController();
+      let timedOut = false;
+      const timer = setTimeout(() => { timedOut = true; controller.abort(new Error('request timeout')); }, remaining);
+      try {
+        const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
+          ...init,
+          redirect: 'error',
+          headers: { ...this.headers, ...(init.body ? { 'content-type': 'application/json' } : {}), ...init.headers },
+          signal: controller.signal,
+        });
+        const text = await response.text();
+        let body: any = undefined;
+        if (text) {
+          try { body = JSON.parse(text); }
+          catch { throw new LlamaRouterError(`${path} returned invalid JSON`); }
+        }
+        if (!response.ok) {
+          this.diagnostic(`${method} ${path} status=${response.status} elapsed=${Date.now() - startedAt}ms`);
+          const message = typeof body?.error === 'string' ? body.error
+            : typeof body?.error?.message === 'string' ? body.error.message
+              : typeof body?.message === 'string' ? body.message : text || response.statusText;
+          throw new LlamaRouterError(`${path} failed (${response.status}): ${String(message)}`);
+        }
+        this.diagnostic(`${method} ${path} status=${response.status} elapsed=${Date.now() - startedAt}ms${retryCode ? ` recoveredAfter=${retryCode}` : ''}`);
+        return body;
+      } catch (error) {
+        if (error instanceof LlamaRouterError) throw error;
+        if (controller.signal.aborted || timedOut) {
+          const code = causeCode(error);
+          this.diagnostic(`${method} ${path} timeout=${this.requestMs}ms elapsed=${Date.now() - startedAt}ms${code ? ` code=${code}` : ''} cause=${this.safeDetail(error)}`);
+          throw new LlamaRouterError(`Request to llama-server at ${target.origin}${target.pathname} timed out after ${this.requestMs}ms`, { cause: error });
+        }
+        const code = causeCode(error);
+        const detail = this.safeDetail(error);
+        if (method === 'GET' && path === '/models' && attempt === 0 && code && retryableCodes.has(code) && deadline - Date.now() > 100) {
+          retryCode = code;
+          attempt++;
+          this.diagnostic(`${method} ${path} failed elapsed=${Date.now() - startedAt}ms code=${code} cause=${detail}; retry=1`);
+          await new Promise(resolve => setTimeout(resolve, 100));
+          continue;
+        }
+        this.diagnostic(`${method} ${path} failed elapsed=${Date.now() - startedAt}ms${code ? ` code=${code}` : ''}${retryCode ? ` retryFailed=${retryCode}` : ''} cause=${detail}`);
+        const prior = retryCode ? ` retryFailed=${retryCode}` : '';
+        throw new LlamaRouterError(`llama-server request failed${code ? ` code=${code}` : ''}${prior} cause=${detail} at ${target.origin}${target.pathname}`, { cause: error });
+      } finally {
+        clearTimeout(timer);
       }
-      if (!response.ok) {
-        this.diagnostic(`${method} ${path} status=${response.status} elapsed=${Date.now() - startedAt}ms`);
-        const message = typeof body?.error === 'string' ? body.error
-          : typeof body?.error?.message === 'string' ? body.error.message
-            : typeof body?.message === 'string' ? body.message : text || response.statusText;
-        throw new LlamaRouterError(`${path} failed (${response.status}): ${String(message)}`);
-      }
-      this.diagnostic(`${method} ${path} status=${response.status} elapsed=${Date.now() - startedAt}ms`);
-      return body;
-    } catch (error) {
-      if (error instanceof LlamaRouterError) throw error;
-      const target = new URL(`${this.baseUrl}${path}`);
-      if (controller.signal.aborted || timedOut) {
-        this.diagnostic(`${method} ${path} timeout=${this.requestMs}ms`);
-        throw new LlamaRouterError(`Request to llama-server at ${target.origin}${target.pathname} timed out after ${this.requestMs}ms`);
-      }
-      this.diagnostic(`${method} ${path} failed elapsed=${Date.now() - startedAt}ms`);
-      const detail = error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300);
-      const code = (error as Error & { cause?: NodeJS.ErrnoException })?.cause?.code;
-      throw new LlamaRouterError(`Cannot reach llama-server at ${target.origin}${target.pathname}${code ? ` (${code})` : ''}: ${detail}. Check that the server is running and the URL, port, and network are correct.`);
-    } finally {
-      clearTimeout(timer);
     }
+  }
+
+  private safeDetail(error: unknown): string {
+    const messages: string[] = [];
+    const seen = new Set<unknown>();
+    for (let current = error; current && !seen.has(current); current = errorCause(current)) {
+      seen.add(current);
+      const message = current instanceof Error ? current.message : typeof current === 'string' ? current : '';
+      if (message && !messages.includes(message)) messages.push(message);
+    }
+    let detail = messages.reverse().join(': ') || String(error);
+    if (this.apiKey) detail = detail.split(this.apiKey).join('[redacted]');
+    detail = detail.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]').replace(/(api[_-]?key|token|password)=([^\s&]+)/gi, '$1=[redacted]');
+    detail = detail.replace(/https?:\/\/[^\s"'<>]+/gi, value => {
+      const trailing = value.match(/[),.;!?]+$/)?.[0] ?? '';
+      const candidate = trailing ? value.slice(0, -trailing.length) : value;
+      try { const url = new URL(candidate); url.username = ''; url.password = ''; url.search = ''; url.hash = ''; return `${url.origin}${url.pathname}${trailing}`; }
+      catch { return `${candidate.replace(/(https?:\/\/)[^/@\s]+@/i, '$1').replace(/[?#].*$/, '')}${trailing}`; }
+    });
+    detail = detail.replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ');
+    return detail.trim().slice(0, 140) || 'connection failed';
   }
 
   private diagnostic(message: string): void {

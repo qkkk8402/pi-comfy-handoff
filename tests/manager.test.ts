@@ -280,6 +280,44 @@ test('model operation errors retain diagnostics while redacting configured crede
   }
 });
 
+test('transient llama model catalog recovery is visible in redacted info logs', async () => {
+  await mkdir('work', { recursive: true });
+  const cwd = await mkdtemp(join(process.cwd(), 'work', 'manager-llama-retry-'));
+  let modelReads = 0;
+  const upstream = createServer((req, res) => {
+    const path = new URL(req.url ?? '/', 'http://upstream').pathname;
+    if (path === '/models' && ++modelReads === 1) { req.socket.destroy(); return; }
+    res.setHeader('content-type', 'application/json');
+    if (path === '/props') { res.end('{"models_autoload":false}'); return; }
+    if (path === '/models') { res.end('{"models":[{"id":"fixture-model","status":{"value":"loaded"}}]}'); return; }
+    res.statusCode = 404; res.end('{}');
+  });
+  const llamaUrl = await listen(upstream);
+  const lines: string[] = [];
+  const manager = createManager({
+    ...parseManagerConfig({ comfyuiUrl: 'http://127.0.0.1:8188', llamaServerUrl: llamaUrl, stateDir: cwd, logLevel: 'info', timeouts: { requestMs: 2_000, modelMs: 2_000, generationMs: 0, settleMs: 100, pollMs: 5 } }),
+    llamaApiKey: 'manager-upstream-secret', listenPort: 0,
+  }, {
+    comfy: { async queue() { return { running: [], pending: [] }; }, async free() {} } as any,
+    vram: { async read() { return { source: 'amdgpu' as const, device: 'card1', totalMiB: 1000, usedMiB: 100, freeMiB: 900 }; }, async waitForRelease() { return { source: 'amdgpu' as const, device: 'card1', totalMiB: 1000, usedMiB: 100, freeMiB: 900 }; } },
+    logSink: line => lines.push(line),
+  });
+  try {
+    await manager.start();
+    const address = manager.server.address(); assert.ok(address && typeof address !== 'string');
+    const response = await fetch(`http://127.0.0.1:${address.port}/connect`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    assert.equal(response.status, 200);
+    assert.ok(modelReads >= 3);
+    assert.ok(lines.some(line => line.includes(' INFO llama GET /models failed elapsed=') && line.includes('retry=1')));
+    assert.ok(lines.some(line => line.includes(' INFO llama GET /models status=200 elapsed=') && line.includes('recoveredAfter=UND_ERR_SOCKET')));
+    assert.ok(lines.every(line => !line.includes('manager-upstream-secret')));
+  } finally {
+    await manager.close();
+    await close(upstream);
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test('a model preflight failure is terminal in the catalog and a retry clears it', async () => {
   await mkdir('work', { recursive: true });
   const cwd = await mkdtemp(join(process.cwd(), 'work', 'manager-model-retry-'));

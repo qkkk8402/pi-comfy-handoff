@@ -79,7 +79,12 @@ export class Runner {
         await options.onAccepted?.(this.publicState(prior));
         return this.publicState(prior);
       }
-      const models = await this.adapters.llama.listModels();
+      let models: ModelState[];
+      try { models = await this.adapters.llama.listModels(); }
+      catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`Generation preflight failed at llama model catalog: ${detail}`, { cause: error });
+      }
       const target = this.resolveTarget(models, options.modelId);
       if (!target) throw new Error('No llama-server model is available');
       if (target.status !== 'loaded') throw new Error(`Model ${target.name} is ${target.status}; connect it before generating`);
